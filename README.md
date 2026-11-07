@@ -16,30 +16,15 @@ Module: `github.com/Wetech-Code/go-common-utilities` · Go 1.26.10 or newer
 | [`s3`](s3) | S3 / SeaweedFS client with Put, Get, Delete, presigned URLs | `*s3.Client` (AWS SDK v2) via `Client.S3` |
 
 Not included, on purpose: ORMs, migrations, repositories, queues, a generic `Database` interface, global clients,
-retries around writes, authorization, anything specific to a product. See the
-[requirements](https://github.com/Wetech-Code/tech-blueprints/blob/main/shared/requirements/2026-11-07-minimal-published-go-common-utilities.md)
-and [ADR-0004](https://github.com/Wetech-Code/tech-blueprints/blob/main/shared/decisions/ADR-0004-simple-published-go-common-utilities-module.md).
+retries around writes, authorization, anything specific to a product. Adding a helper needs a concrete consumer and a review.
 
 ## Install
 
 ```sh
-go get github.com/Wetech-Code/go-common-utilities@latest   # or pin: @v0.1.0
+go get github.com/Wetech-Code/go-common-utilities@latest   # or pin a version, e.g. @v0.1.1
 ```
 
-The repository is **private**, so Go needs to know not to use the public proxy and needs GitHub credentials:
-
-```sh
-go env -w GOPRIVATE=github.com/Wetech-Code/*
-
-# Pick one way to authenticate git over HTTPS:
-gh auth setup-git                      # uses your GitHub CLI login
-# or a token with read access to this repo (fine-grained PAT, "Contents: read"):
-git config --global url."https://<user>:<token>@github.com/".insteadOf "https://github.com/"
-```
-
-In CI, give the job a token that can read this repository (a GitHub App token or fine-grained PAT stored as a secret;
-the default `GITHUB_TOKEN` of another repo cannot) and run the same two commands before `go build`. In Docker builds,
-pass the token as a build secret rather than an `ARG`. Never commit the token.
+API documentation: https://pkg.go.dev/github.com/Wetech-Code/go-common-utilities
 
 ## Import
 
@@ -227,8 +212,7 @@ One tag covers all six packages. There is no registry or package server; `go get
   See which versions exist with `go list -m -versions github.com/Wetech-Code/go-common-utilities`.
 - **Dependencies:** update them in a pull request (`go get -u ./... && go mod tidy`, then `scripts/check.sh`, which
   includes `govulncheck`). Raising the minimum Go version is treated as a minor release.
-- **Verify a published tag** from a clean module: `CONSUMER_VERSION=v0.1.0 scripts/consumer-check.sh`
-  (needs the private-repo access described above).
+- **Verify a published tag** from a clean module: `CONSUMER_VERSION=v0.1.0 scripts/consumer-check.sh`.
 
 ## Contributing
 
@@ -245,4 +229,4 @@ When Go or module files are staged it runs `gofmt`, `go mod tidy` consistency (i
 Open a pull request from a branch; don't push to `main`. Keep the scope small: a new helper needs a concrete consumer
 and a review before it is added (requirement GCU-14). A new package needs a documented API, unit tests, an example and,
 for a network service, an opt-in integration test. Run the commands under "Run the tests" and `gofmt -l .` before pushing.
-No licence has been chosen yet, so this repository is not open source.
+Released under the [MIT licence](LICENSE).
