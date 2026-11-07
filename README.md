@@ -179,7 +179,7 @@ Integration tests are opt-in: they need the `integration` build tag and a dispos
 docker run -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18
 docker run -d -p 27017:27017 mongo:8.0
 docker run -d -p 6379:6379 redis:8
-# SeaweedFS needs an S3 identity file; scripts/seaweedfs-test.sh starts one in Docker and runs the s3 test for you
+# SeaweedFS needs an S3 identity file (or `brew install seaweedfs` and `weed server -s3 -s3.config=...`); scripts/seaweedfs-test.sh starts one in Docker and runs the s3 test for you
 # (the manual "ci" workflow does the same).
 
 GCU_TEST_POSTGRES_URL='postgres://postgres@localhost:5432/postgres?sslmode=disable' \
@@ -203,10 +203,11 @@ Chosen and verified on 2026-11-07.
 | `go.mongodb.org/mongo-driver/v2` | v2.10.0 |
 | `github.com/redis/go-redis/v9` | v9.23.0 |
 | `github.com/aws/aws-sdk-go-v2` / `service/s3` / `credentials` | v1.47.8 / v1.114.9 / v1.20.16 |
-| SeaweedFS (integration target) | 4.52 (`chrislusf/seaweedfs:4.52`) |
+| SeaweedFS (integration tested) | 4.52 |
 
-Compatibility is only claimed for what the integration tests actually ran; the PR description records which server
-versions that was. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
+Integration tests were run on 2026-11-07 against PostgreSQL 16.14, MongoDB 8.3.4, Redis 8.8.0 and SeaweedFS 4.52
+(all installed locally with Homebrew, no Docker), and all passed. Compatibility is only claimed for what those tests
+ran; other server versions are untested. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
 rejection. Multipart upload, listing and tagging are not covered.
 
 ## Releases and upgrades
