@@ -65,3 +65,14 @@ func TestNewHonoursCancelledContext(t *testing.T) {
 		t.Fatal("want error for cancelled context")
 	}
 }
+
+func TestNewRejectsAnInvalidConfigBeforeConnecting(t *testing.T) {
+	if pool, err := postgres.New(context.Background(), postgres.Config{}); err == nil {
+		pool.Close()
+		t.Fatal("New with no URL should fail")
+	}
+	if pool, err := postgres.New(context.Background(), postgres.Config{URL: "postgres://h/d", MinConns: 5, MaxConns: 2}); err == nil {
+		pool.Close()
+		t.Fatal("New with MinConns above MaxConns should fail")
+	}
+}
