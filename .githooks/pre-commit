@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Fast checks before every commit. Skipped when no Go or module files are staged.
+# Enable once per clone:  git config core.hooksPath .githooks
+# Skip for one commit:    git commit --no-verify
+# The full gate (race tests, consumer build, govulncheck) is scripts/check.sh.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+staged() { git diff --cached --name-only --diff-filter=ACMR -z -- "$@"; }
+
+if [ -z "$(staged '*.go' go.mod go.sum | tr -d '\0')" ]; then
+  exit 0
+fi
+
+echo "pre-commit: gofmt"
+unformatted="$(staged '*.go' | xargs -0 gofmt -l 2>/dev/null || true)"
+if [ -n "$unformatted" ]; then
+  echo "These files are not gofmt-formatted (run: gofmt -w <file>):" >&2
+  echo "$unformatted" >&2
+  exit 1
+fi
+
+if [ -n "$(staged go.mod go.sum | tr -d '\0')" ]; then
+  echo "pre-commit: go mod tidy"
+  go mod tidy -diff >/dev/null || { echo "go.mod/go.sum are not tidy (run: go mod tidy)" >&2; exit 1; }
+fi
+
+echo "pre-commit: go vet"
+go vet ./...
+
+echo "pre-commit: go test"
+go test ./...
