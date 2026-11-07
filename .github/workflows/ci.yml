@@ -1,0 +1,130 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1" # weekly, so new vulnerability advisories surface without a code change
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.26.10", "1.27.3"] # go.mod minimum, and the latest tested release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go.mod is tidy and verified
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+          go mod verify
+      - run: go vet ./...
+      - name: Unit tests with race detector
+        run: go test -race -count=1 ./...
+      - name: Independent consumer builds and runs
+        run: scripts/consumer-check.sh
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  integration:
+    name: integration (PostgreSQL, MongoDB, Redis, SeaweedFS)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust # disposable runner-local database, no password to leak
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 12
+      mongodb:
+        image: mongo:8.0
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'" --health-interval 5s --health-timeout 10s --health-retries 12
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      SEAWEEDFS_IMAGE: chrislusf/seaweedfs:4.52
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+
+      - name: Start SeaweedFS with random throwaway credentials
+        run: |
+          access="$(openssl rand -hex 8)"
+          secret="$(openssl rand -hex 16)"
+          echo "::add-mask::$access"
+          echo "::add-mask::$secret"
+          {
+            echo "GCU_TEST_S3_ENDPOINT=http://localhost:8333"
+            echo "GCU_TEST_S3_ACCESS_KEY=$access"
+            echo "GCU_TEST_S3_SECRET_KEY=$secret"
+            echo "GCU_TEST_POSTGRES_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable"
+            echo "GCU_TEST_MONGODB_URI=mongodb://localhost:27017/?directConnection=true"
+            echo "GCU_TEST_REDIS_URL=redis://localhost:6379/0"
+          } >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/s3.json" <<JSON
+          {"identities":[{"name":"ci","credentials":[{"accessKey":"$access","secretKey":"$secret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+          JSON
+          docker run -d --name seaweedfs -p 8333:8333 -p 9333:9333 \
+            -v "$RUNNER_TEMP/s3.json:/etc/seaweedfs/s3.json:ro" \
+            "$SEAWEEDFS_IMAGE" server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:9333/dir/assign | grep -q '"fid"' && curl -s -o /dev/null http://localhost:8333/; then
+              echo "SeaweedFS ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          docker logs seaweedfs | tail -50
+          echo "SeaweedFS did not become ready" >&2
+          exit 1
+
+      - name: Record the service versions under test
+        run: |
+          docker ps --format '{{.Image}}' | sort
+          docker exec seaweedfs weed version
+          docker exec "$(docker ps -q --filter ancestor=postgres:18)" postgres --version
+          docker exec "$(docker ps -q --filter ancestor=mongo:8.0)" mongod --version | head -1
+          docker exec "$(docker ps -q --filter ancestor=redis:8)" redis-server --version
+          go version
+
+      - name: Integration tests
+        run: |
+          set -o pipefail
+          go test -tags integration -race -count=1 -v -run Integration ./... 2>&1 | tee integration.log
+          # A skipped test proves nothing, so any skip fails the job.
+          if grep -e '--- SKIP' integration.log; then echo "integration test skipped" >&2; exit 1; fi
+
+      - name: Independent consumer talks to every service
+        run: scripts/consumer-check.sh
