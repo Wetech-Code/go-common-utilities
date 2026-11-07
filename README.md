@@ -111,9 +111,39 @@ MONGODB_URI=mongodb://app:<password>@mongo.internal:27017/?tls=true&replicaSet=r
 `URL` is `redis://[user:password@]host:port/db`, or `rediss://` for TLS (certificates are verified).
 Optional: `PoolSize`, `DialTimeout`, `ReadTimeout`, `WriteTimeout`. You get a go-redis v9 client.
 
-```sh
-REDIS_URL=rediss://:<password>@redis.internal:6380/0
+For plain `(value, error)` methods instead of go-redis command objects, wrap it with `redis.Wrap`. `Client` has a
+method for **every command go-redis implements (620 as of v9.23.0)**, so `c.Set`, `c.Get`, `c.HSet`, `c.LPush`, `c.ZAdd`, `c.XAdd`,
+`c.GeoAdd`, `c.JSONSet`, `c.TSAdd` and the rest are all there. A key, field or member that does not exist gives
+`redis.ErrNotFound` (use `errors.Is`), not go-redis's `redis.Nil`:
+
+```go
+c := redis.Wrap(rdb)             // rdb from redis.New; c.Close() closes it
+err := c.Set(ctx, "greeting", "hello", time.Minute)
+v, err := c.Get(ctx, "greeting") // errors.Is(err, redis.ErrNotFound) when missing
+n, err := c.Incr(ctx, "visits")
 ```
+
+| Family | Examples |
+| --- | --- |
+| Strings, counters, keys | `Set` `SetNX` `Get` `GetEx` `MGet` `Incr` `Del` `Unlink` `Expire` `TTL` `Scan` `Copy` `Dump` |
+| Hashes, lists, sets | `HSet` `HGetAll` `HScan` `LPush` `LMove` `BLPop` `SAdd` `SInter` `SMembersMap` |
+| Sorted sets | `ZAdd` `ZRange` `ZRangeByScore` `ZPopMin` `ZUnionStore` `ZScore` |
+| Streams | `XAdd` `XRead` `XReadGroup` `XAck` `XPending` `XInfoStream` |
+| Bitmaps, HyperLogLog, geo | `SetBit` `BitCount` `PFAdd` `PFCount` `GeoAdd` `GeoSearch` |
+| Scripts, functions, batches | `Eval` `EvalSha` `FCall` `Pipelined` `TxPipelined` `Watch` |
+| Pub/sub | `Publish` `Subscribe` `PubSubChannels` |
+| Server and cluster | `Info` `DBSize` `ConfigGet` `ClientList` `Cluster*` |
+| Modules (need a server with them) | `JSONSet` `TSAdd` `BFAdd` `FTSearch` `VAdd` |
+
+About 60 common methods are written by hand in `redis/client.go`; the rest are generated from go-redis's own source into
+`redis/client_gen.go` by `internal/genredis`. After changing the go-redis version run `go generate ./redis` and review
+the diff; a unit test fails if go-redis gains a command that has not been generated. Arguments such as `XAddArgs` and
+`GeoLocation` are go-redis types. Not wrapped: `Monitor` (a streaming command; use `c.Native`), and `Quit`, `Sync` and `JSONDebugMemory`, which go-redis itself
+implements as panics.
+
+**Dangerous commands are included.** `FlushAll`, `FlushDB`, `Shutdown`, `ConfigSet`, ACL changes, `Keys`, `Migrate`,
+cluster failover and similar methods are present and marked "Dangerous" in their documentation. Nothing in this library
+calls them, and the tests never do. Business queues, locks and key conventions are still left to the caller.
 
 ### S3 / SeaweedFS
 
@@ -168,6 +198,23 @@ go test -tags integration -race -count=1 -v -run Integration ./...
 
 Never point integration tests at a shared or production system: they create and delete their own uniquely named
 collections, keys and objects, but they are still tests.
+
+### Redis wrapper coverage
+
+Every `redis.Client` method is called by at least one test; `TestEveryWrapperIsCalledByATest` fails otherwise, so adding
+a go-redis command without a test breaks the build. The Redis tests that change server state (FLUSHALL, CONFIG SET,
+ACL, SHUTDOWN, cluster, MIGRATE, ...) start their own throwaway servers, never the ones above: a `redis:8` container
+by default (it bundles the JSON, Search, TimeSeries and Bloom-family modules), or the binary named by
+`GCU_TEST_REDIS_SERVER`. The two-node cluster test (`ClusterMeet`, `ClusterReplicate`, `ClusterFailover`,
+`ClusterForget`) needs that local binary, because Docker port mappings cannot join cluster nodes; `scripts/integration.sh`
+runs it when `redis-server` is installed and prints a warning when it is not.
+
+Most tests check that the server accepts the command and the reply decodes (a smoke test), with value checks on the
+common ones. A few commands can only be exercised as far as the server's own refusal, because a bare test server has
+no config file or the feature is not in open-source Redis: `ConfigRewrite`, `ModuleLoadex`, `ClientMaintNotifications`
+(Redis Cloud/Enterprise only), `FunctionKill` and `ScriptKill` (nothing running to kill), `FTCursorRead`/`FTCursorDel`
+(go-redis does not expose a cursor id), and `JSONArrTrim` (go-redis omits the required start and stop). `Shutdown*` is
+checked by the server's port closing.
 
 ## Versions
 

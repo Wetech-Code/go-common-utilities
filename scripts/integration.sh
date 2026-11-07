@@ -36,11 +36,13 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
-echo "== server versions"
-docker compose exec -T postgres postgres --version
-docker compose exec -T mongodb mongod --version | head -1
-docker compose exec -T redis redis-server --version
-docker compose exec -T seaweedfs weed version | head -1
+echo "== server versions (informational; a failure here does not fail the run)"
+{
+  docker compose exec -T postgres postgres --version
+  docker compose exec -T mongodb mongod --version | head -1
+  docker compose exec -T redis redis-server --version
+  docker compose exec -T seaweedfs weed version | head -1
+} || true
 
 export GCU_TEST_POSTGRES_URL='postgres://postgres@localhost:15432/postgres?sslmode=disable'
 export GCU_TEST_MONGODB_URI='mongodb://localhost:27117/?directConnection=true'
@@ -50,9 +52,20 @@ export GCU_TEST_S3_ACCESS_KEY="$access"
 export GCU_TEST_S3_SECRET_KEY="$secret"
 
 echo "== integration tests"
+# The redis tests start their own disposable servers: redis:8 containers for most,
+# including the module commands (JSON, Search, TimeSeries, Bloom, ...).
 go test -tags integration -race -count=1 -v -run Integration ./... | tee "$dir/out.log"
-# A skipped test proves nothing.
-if grep -e '--- SKIP' "$dir/out.log"; then echo "an integration test was skipped" >&2; exit 1; fi
+
+# The two-node cluster test needs a local redis-server binary (Docker port mappings
+# cannot join cluster nodes). Run it when one is installed.
+if command -v redis-server >/dev/null; then
+  GCU_TEST_REDIS_SERVER="$(command -v redis-server)" go test -tags integration -race -count=1 -v -run 'IntegrationClusterMultiNode' ./redis | tee -a "$dir/out.log"
+else
+  echo "WARNING: redis-server not installed, so TestIntegrationClusterMultiNode (ClusterMeet/Replicate/Failover/Forget) was NOT run." >&2
+fi
+
+# A skipped test proves nothing. The only skip allowed is that multi-node test when no binary exists.
+if grep -e '--- SKIP' "$dir/out.log" | grep -v 'ClusterMultiNode'; then echo "an integration test was skipped" >&2; exit 1; fi
 
 echo "== independent consumer against the same servers"
 scripts/consumer-check.sh
