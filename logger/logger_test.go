@@ -45,8 +45,9 @@ func TestRedactsSensitiveKeys(t *testing.T) {
 	log, _ := logger.New(logger.Config{Output: &buf})
 	log.Info("login", "user", "ann", "password", "hunter2", "Authorization", "Bearer abc",
 		slog.Group("db", slog.String("api_key", "k-123")))
+	log.Info("more", "API-Key", "k-456", "private.key", "pem-789", "DB_DSN", "postgres://u:dsn-pw@h/d", "clientSecret", "cs-000")
 	out := buf.String()
-	for _, leaked := range []string{"hunter2", "Bearer abc", "k-123"} {
+	for _, leaked := range []string{"hunter2", "Bearer abc", "k-123", "k-456", "pem-789", "dsn-pw", "cs-000"} {
 		if strings.Contains(out, leaked) {
 			t.Errorf("secret %q leaked: %s", leaked, out)
 		}

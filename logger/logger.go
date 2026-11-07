@@ -2,7 +2,7 @@
 //
 // It does not keep a global logger: New returns a logger that the caller owns
 // and passes around. Attributes whose key looks sensitive (password, secret,
-// token, authorization, cookie, api key) are replaced with "[REDACTED]".
+// token, authorization, cookie, api key, credential, dsn) are replaced with "[REDACTED]".
 //
 //	log, err := logger.New(logger.Config{Level: "debug", Format: "json"})
 //	if err != nil {
@@ -71,11 +71,18 @@ func ParseLevel(s string) (slog.Level, error) {
 	return 0, fmt.Errorf("logger: unknown level %q (want debug, info, warn or error)", s)
 }
 
-// sensitive lists key fragments that cause a value to be hidden.
-var sensitive = []string{"password", "passwd", "secret", "token", "authorization", "cookie", "api_key", "apikey"}
+// sensitive lists key fragments that cause a value to be hidden. Keys are
+// lower-cased and stripped of "-", "_", "." and spaces before matching, so
+// "API-Key", "api_key" and "apiKey" are all caught.
+var sensitive = []string{
+	"password", "passwd", "secret", "token", "authorization", "cookie",
+	"apikey", "privatekey", "credential", "connectionstring", "dsn",
+}
+
+var keyNormalizer = strings.NewReplacer("-", "", "_", "", ".", "", " ", "")
 
 func redact(_ []string, a slog.Attr) slog.Attr {
-	key := strings.ToLower(a.Key)
+	key := keyNormalizer.Replace(strings.ToLower(a.Key))
 	for _, s := range sensitive {
 		if strings.Contains(key, s) {
 			return slog.String(a.Key, "[REDACTED]")

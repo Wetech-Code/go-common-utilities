@@ -211,3 +211,26 @@ func TestRejectsEmptyKey(t *testing.T) {
 		t.Error("want error for empty key")
 	}
 }
+
+func TestRejectsUnsafeKeys(t *testing.T) {
+	_, srv := newFake(t)
+	ctx := context.Background()
+	c, err := s3.New(ctx, cfg(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, key := range []string{"../other/x", "a/../../other/x", "a/./b", "/abs", `a\b`, "a\nb", "..", "a/.."} {
+		if c.Delete(ctx, key) == nil {
+			t.Errorf("Delete(%q): want error", key)
+		}
+		if _, err := c.PresignGet(ctx, key, time.Minute); err == nil {
+			t.Errorf("PresignGet(%q): want error", key)
+		}
+	}
+	for _, key := range []string{"a/b.txt", "..hidden", "a/b..c", "dir/file name.txt", "ünï/çödé"} {
+		if err := c.Delete(ctx, key); err != nil {
+			t.Errorf("Delete(%q): %v", key, err)
+		}
+	}
+}

@@ -155,7 +155,14 @@ anywhere in this module.
 go vet ./...
 go test -race ./...                      # unit tests, no services needed
 scripts/consumer-check.sh                # builds a separate throwaway module that imports all six packages
+scripts/check.sh                         # everything above plus gofmt, go mod tidy/verify and govulncheck
+scripts/seaweedfs-test.sh                # SeaweedFS in Docker: s3 integration test + consumer check
 ```
+
+Nothing runs automatically. `scripts/check.sh` is the gate, run by the author and reviewer before merging. The same
+checks, plus the PostgreSQL, MongoDB, Redis and SeaweedFS integration tests in containers, are available as a GitHub
+Actions workflow that only starts when you trigger it by hand: Actions tab, "ci", "Run workflow", or
+`gh workflow run ci.yml --ref <branch>` (GitHub only offers it once the file is on the default branch).
 
 Integration tests are opt-in: they need the `integration` build tag and a disposable service, and each one is skipped
 (and reported as skipped with `-v`) when its variable is unset.
@@ -172,7 +179,8 @@ Integration tests are opt-in: they need the `integration` build tag and a dispos
 docker run -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18
 docker run -d -p 27017:27017 mongo:8.0
 docker run -d -p 6379:6379 redis:8
-# SeaweedFS needs an S3 identity file, see the "integration" job in .github/workflows/ci.yml for the exact command.
+# SeaweedFS needs an S3 identity file; scripts/seaweedfs-test.sh starts one in Docker and runs the s3 test for you
+# (the manual "ci" workflow does the same).
 
 GCU_TEST_POSTGRES_URL='postgres://postgres@localhost:5432/postgres?sslmode=disable' \
 GCU_TEST_MONGODB_URI='mongodb://localhost:27017/?directConnection=true' \
@@ -183,9 +191,6 @@ go test -tags integration -race -count=1 -v -run Integration ./...
 Never point integration tests at a shared or production system: they create and delete their own uniquely named
 collections, keys and objects, but they are still tests.
 
-CI (`.github/workflows/ci.yml`) runs on every pull request: formatting, `go mod tidy`/`verify`, `go vet`,
-race-enabled unit tests on the minimum and newest Go versions, the consumer build, `govulncheck`, and the integration
-tests against PostgreSQL, MongoDB, Redis and SeaweedFS containers.
 
 ## Versions
 
@@ -200,24 +205,24 @@ Chosen and verified on 2026-11-07.
 | `github.com/aws/aws-sdk-go-v2` / `service/s3` / `credentials` | v1.47.8 / v1.114.9 / v1.20.16 |
 | SeaweedFS (integration target) | 4.52 (`chrislusf/seaweedfs:4.52`) |
 
-See the PR description for what was actually executed against which server versions. Compatibility is only claimed for
-what the integration tests ran; for SeaweedFS that is single-object Put/Get/Delete, presigned GET/PUT, and
-credential rejection. Multipart upload, listing and tagging are not covered.
+Compatibility is only claimed for what the integration tests actually ran; the PR description records which server
+versions that was. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
+rejection. Multipart upload, listing and tagging are not covered.
 
 ## Releases and upgrades
 
 Releases are ordinary Git tags following [semantic versioning](https://semver.org): `v0.1.0`, `v0.1.1`, `v0.2.0`, ...
 One tag covers all six packages. There is no registry or package server; `go get` fetches the tag from GitHub.
 
-- **Release:** after a pull request is reviewed, merged and CI is green on `main`, a maintainer tags that commit
+- **Release:** after a pull request is reviewed and merged, and `scripts/check.sh` passes on `main`, a maintainer tags that commit
   (`git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0`) and creates a GitHub release with notes. Tags are never
   moved or deleted; a bad release is fixed by publishing the next patch version.
 - **Before 1.0**, a minor bump (`v0.1` → `v0.2`) may change an API; patch bumps (`v0.1.0` → `v0.1.1`) will not. Release
   notes list every breaking change.
 - **Upgrade a consumer:** `go get github.com/Wetech-Code/go-common-utilities@v0.2.0 && go mod tidy`, then run your tests.
   See which versions exist with `go list -m -versions github.com/Wetech-Code/go-common-utilities`.
-- **Dependencies:** Dependabot opens weekly update PRs for Go modules and GitHub Actions. Raising the minimum Go version
-  is treated as a minor release.
+- **Dependencies:** update them in a pull request (`go get -u ./... && go mod tidy`, then `scripts/check.sh`, which
+  includes `govulncheck`). Raising the minimum Go version is treated as a minor release.
 - **Verify a published tag** from a clean module: `CONSUMER_VERSION=v0.1.0 scripts/consumer-check.sh`
   (needs the private-repo access described above).
 

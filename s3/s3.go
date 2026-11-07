@@ -245,9 +245,26 @@ func (c *Client) PresignPut(ctx context.Context, key string, expires time.Durati
 	return req.URL, nil
 }
 
+// checkKey rejects keys that are empty or that a proxy or gateway could
+// interpret as a path rather than a name: control characters, backslashes, a
+// leading slash, and "." or ".." segments (which could escape the bucket in
+// path-style URLs).
 func checkKey(key string) error {
 	if strings.TrimSpace(key) == "" {
 		return errors.New("s3: key must not be empty")
+	}
+	if strings.HasPrefix(key, "/") || strings.ContainsRune(key, '\\') {
+		return errors.New("s3: key must not start with / or contain backslashes")
+	}
+	for _, r := range key {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("s3: key must not contain control characters")
+		}
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "." || seg == ".." {
+			return errors.New(`s3: key must not contain "." or ".." path segments`)
+		}
 	}
 	return nil
 }
