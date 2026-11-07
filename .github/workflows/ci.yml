@@ -2,8 +2,17 @@ name: ci
 
 # Manual only: runs when someone clicks "Run workflow" (or `gh workflow run ci.yml`).
 # It never runs on push, pull request or a schedule.
+# To publish, run it from main and fill in release_version (for example v0.1.0).
+# The release job then tags that commit and creates the GitHub release, but only
+# after every check and integration test below has passed.
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Leave empty to only run checks. Or a new version to publish, like v0.1.0"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -126,3 +135,42 @@ jobs:
 
       - name: Independent consumer talks to every service
         run: scripts/consumer-check.sh
+
+  release:
+    name: release ${{ inputs.release_version }}
+    if: inputs.release_version != '' && github.ref == 'refs/heads/main'
+    needs: [check, vulncheck, integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the GitHub release
+    env:
+      VERSION: ${{ inputs.release_version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # needed to push the tag
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: Check the version is new and well formed
+        run: |
+          if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "release_version must look like v0.1.0" >&2; exit 1
+          fi
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "$VERSION already exists; tags are never moved. Pick the next version." >&2; exit 1
+          fi
+      - name: Tag and create the GitHub release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+          gh release create "$VERSION" --title "$VERSION" --generate-notes
+      - name: Consumer installs the published tag
+        run: |
+          go env -w GOPRIVATE='github.com/Wetech-Code/*'
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          CONSUMER_VERSION="$VERSION" scripts/consumer-check.sh
