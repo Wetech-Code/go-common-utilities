@@ -16,6 +16,7 @@ func TestValidate(t *testing.T) {
 		"min above max":      {URL: "postgres://h/d", MaxConns: 2, MinConns: 3},
 		"negative duration":  {URL: "postgres://h/d", ConnectTimeout: -time.Second},
 		"negative idle time": {URL: "postgres://h/d", MaxConnIdleTime: -1},
+		"empty type name":    {URL: "postgres://h/d", Types: []string{"hstore", " "}},
 	}
 	for name, cfg := range tests {
 		if err := cfg.Validate(); err == nil {
