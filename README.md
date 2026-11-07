@@ -96,6 +96,70 @@ Use the returned pool exactly as you would use pgx (`pool.Query`, `pool.Begin`, 
 DATABASE_URL=postgres://app:<password>@db.internal:5432/app?sslmode=verify-full
 ```
 
+For plain methods and the usual conveniences, wrap the pool with `postgres.Wrap`. You still write the SQL; nothing
+here builds queries or knows your schema, so it is not an ORM. A missing row is `postgres.ErrNotFound` (use `errors.Is`):
+
+```go
+c := postgres.Wrap(pool)                          // pool from postgres.New; c.Close() closes it
+
+n, err := c.Exec(ctx, "UPDATE users SET name = $1 WHERE id = $2", "Ann", 7) // rows affected
+
+type User struct{ ID int64; Email string; OwnerID *int64 } // filled by column name, see below
+u, err := postgres.Get[User](ctx, c, "SELECT id, email, owner_id FROM users WHERE id = $1", 7)
+all, err := postgres.Select[User](ctx, c, "SELECT id, email FROM users")      // or Select[*User]
+count, err := postgres.Get[int64](ctx, c, "SELECT count(*) FROM users")
+
+var user User                                     // or the sqlx style, filling a destination you pass in
+err = c.Get(ctx, &user, "SELECT id, email FROM users WHERE id = $1", 7)
+var users []User                                  // also *[]*User, *[]string, *[]int64, ...
+err = c.Select(ctx, &users, "SELECT id, email FROM users ORDER BY id")
+
+err = c.WithTx(ctx, func(tx postgres.Tx) error {  // commits on nil, rolls back on error or panic
+	_, err := tx.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", 8, "b@x.io")
+	return err
+})
+if postgres.IsUniqueViolation(err) { /* duplicate key */ }
+```
+
+| Group | Methods |
+| --- | --- |
+| Run SQL | `Exec` `ExecTag` `Query` `QueryRow` `Exists`; scanning: methods `Get` `Select` (into a destination you pass) and package functions `Get[T]` `Select[T]` `SelectMaps` (these also work inside a `Tx`) |
+| Transactions | `WithTx` `WithTxOptions` `Begin` `BeginTx` (inside, `Tx` is the full pgx transaction: `Exec`, `Query`, `CopyFrom`, `SendBatch`, savepoints) |
+| Bulk and batches | `CopyFrom` `CopyFromRows` `SendBatch` `RunBatch` |
+| Dedicated connections | `Acquire` `AcquireFunc` `AcquireAllIdle` |
+| LISTEN / NOTIFY | `Notify` `Listen` (then `Wait`, `Close` on the `Listener`) |
+| Pool | `Ping` `Stat` `Config` `Reset` `Close` |
+| Errors | `ErrNotFound` `ErrTooManyRows` `ErrorCode` `ConstraintName` `IsUniqueViolation` `IsForeignKeyViolation` `IsNotNullViolation` `IsCheckViolation` `IsSerializationFailure` `IsDeadlock` |
+
+**Struct scanning.** `Get`, `Select` and their generic forms fill a struct, a pointer to a struct, a `map[string]any`, or a single
+value (`int64`, `string`, `time.Time`, `[]byte`, `pgtype.Numeric`, `netip.Addr`, a pointer for a nullable column, ...).
+Field types are whatever pgx can scan: arrays into slices, `jsonb`/`json` into maps, structs or `json.RawMessage`, enums into
+string types, `uuid`, `inet`, `interval`, `numeric` and so on.
+
+- **Matching:** a field matches a column by its `db:"name"` tag, else by its Go name ignoring case (`ID` ↔ `id`) or in snake_case
+  (`UserID` ↔ `user_id`, `HTTPServer` ↔ `http_server`). Quoted mixed-case column names match too.
+- **Lax:** columns with no field are ignored, and fields with no column keep their value. `db:"-"` skips a field and unexported
+  fields are ignored.
+- **Embedded structs** are flattened, including embedded pointers (allocated only when a column needs them, even when the pointer's
+  type is unexported). An outer field wins over an embedded one of the same name.
+- **One JSON column:** if the query returns a single `json`/`jsonb` column that matches no field, the whole value is decoded into
+  the struct with `encoding/json`, so `SELECT to_jsonb(u) FROM users u` fills a struct that has `json` tags.
+- **Safety:** two columns that map to the same field (a join with two `id` columns) is an error, so one never silently overwrites
+  the other; alias one in the query.
+- **NULL:** a `NULL` in a column mapped to a plain (non-pointer) field is an error by default, because a silent zero hides bugs. Use
+  a pointer (`*string`), a `sql.Null*` type, or opt in per field with `db:"nick,nullzero"` to get the zero value instead.
+- **Custom Postgres types:** list them in `Config.Types` and they are registered on every connection, with their array types:
+  `postgres.Config{URL: url, Types: []string{"hstore", "app.mood", "app.address"}}`. This covers `hstore` (scan into
+  `pgtype.Hstore`), enums, domains, ranges and composites. A composite scans into a struct (or `*struct`, nil for `NULL`) by
+  attribute name, using the same matching rules as columns. List a type's dependencies first, and `CREATE EXTENSION hstore` first.
+  A type that does not exist makes `New` fail at startup. Not supported: arrays of composite values into `[]Struct` (scan those
+  into a `pgtype` array, or select the elements as rows).
+- **Results:** `Get` returns `ErrNotFound` for no rows and `ErrTooManyRows` for several; `Select` returns an empty, non-nil slice
+  for none. A single-value type needs a one-column query.
+
+`WithTx` never retries by itself; on `IsSerializationFailure` or `IsDeadlock` you can run the whole transaction again.
+Every method is called by at least one test, and a test fails if a pgx pool method has no wrapper.
+
 ### MongoDB
 
 `URI` starts with `mongodb://` or `mongodb+srv://`; add `tls=true` (implicit for `+srv`) for TLS.
