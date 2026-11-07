@@ -1,11 +1,9 @@
 name: ci
 
+# Manual only: runs when someone clicks "Run workflow" (or `gh workflow run ci.yml`).
+# It never runs on push, pull request or a schedule.
 on:
-  pull_request:
-  push:
-    branches: [main]
-  schedule:
-    - cron: "17 5 * * 1" # weekly, so new vulnerability advisories surface without a code change
+  workflow_dispatch:
 
 permissions:
   contents: read
