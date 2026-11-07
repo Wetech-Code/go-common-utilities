@@ -216,8 +216,10 @@ Releases are ordinary Git tags following [semantic versioning](https://semver.or
 One tag covers all six packages. There is no registry or package server; `go get` fetches the tag from GitHub.
 
 - **Release:** after a pull request is reviewed and merged, and `scripts/check.sh` passes on `main`, a maintainer
-  publishes from the Actions tab: run the "ci" workflow on `main` and choose `release`: `patch`, `minor` or `major`
-  (`none` only runs the checks). The workflow works out the next version from the latest tag (the first release is
+  publishes from the Actions tab: run the "ci" workflow on `main` and choose `release`: `auto`, `patch`, `minor` or
+  `major` (`none` only runs the checks). `auto` reads the commit messages since the last tag: `type!:` or a
+  `BREAKING CHANGE` footer means major, `feat:` means minor, anything else patch. Before 1.0 a breaking change gives
+  a minor bump, and `v1.0.0` must be chosen explicitly with `major`. `auto` fails if nothing changed since the last tag. The workflow works out the next version from the latest tag (the first release is
   always `v0.1.0`), re-runs every check and integration test, and only then creates the tag and the GitHub release and
   installs the new tag from a clean consumer module. By hand, the equivalent is
   `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` plus `gh release create v0.1.0`. Tags are never
