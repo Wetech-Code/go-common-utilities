@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	neturl "net/url"
 	"os"
 	"strings"
 	"sync"
@@ -807,6 +808,240 @@ func TestIntegrationClient(t *testing.T) {
 		c2.Close() // safe to call twice
 		if err := c2.Ping(ctx); err == nil {
 			t.Fatal("Ping after Close should fail")
+		}
+	})
+}
+
+// Failure paths: every place the Client returns an error from the server or driver.
+func TestIntegrationFailurePaths(t *testing.T) {
+	url := os.Getenv("GCU_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("GCU_TEST_POSTGRES_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool, err := postgres.New(ctx, postgres.Config{URL: url, MaxConns: 4})
+	must(err)
+	c := postgres.Wrap(pool)
+	defer c.Close()
+
+	t.Run("bad SQL is an error from every query method", func(t *testing.T) {
+		bad := "SELECT * FROM table_that_does_not_exist"
+		if _, err := c.Exists(ctx, bad); err == nil {
+			t.Error("Exists")
+		}
+		if _, err := postgres.SelectMaps(ctx, c, bad); err == nil {
+			t.Error("SelectMaps")
+		}
+		if _, err := postgres.Select[int](ctx, c, bad); err == nil {
+			t.Error("Select")
+		}
+		if _, err := postgres.Get[int](ctx, c, bad); err == nil {
+			t.Error("Get")
+		}
+		var n int
+		if err := c.Get(ctx, &n, bad); err == nil {
+			t.Error("c.Get")
+		}
+		var ns []int
+		if err := c.Select(ctx, &ns, bad); err == nil {
+			t.Error("c.Select")
+		}
+		if _, err := c.Query(ctx, bad); err == nil {
+			t.Error("Query")
+		}
+		if _, err := c.Exec(ctx, bad); err == nil {
+			t.Error("Exec")
+		}
+	})
+
+	t.Run("errors that arrive while rows are being read", func(t *testing.T) {
+		// 1/(2-x) divides by zero on the second row, after the first was returned.
+		const midStream = "SELECT 1/(2-x) FROM generate_series(1,3) x"
+		if _, err := postgres.Select[int](ctx, c, midStream); err == nil {
+			t.Error("Select should report an error raised mid-stream")
+		}
+		if _, err := postgres.Get[int](ctx, c, midStream); err == nil || errors.Is(err, postgres.ErrTooManyRows) {
+			t.Errorf("Get should report the real error, not ErrTooManyRows: %v", err)
+		}
+		if _, err := postgres.SelectMaps(ctx, c, midStream); err == nil {
+			t.Error("SelectMaps should report an error raised mid-stream")
+		}
+		// the error comes before any row at all
+		if _, err := postgres.Get[int](ctx, c, "SELECT 1/0"); err == nil || errors.Is(err, postgres.ErrNotFound) {
+			t.Errorf("Get should report division by zero, not ErrNotFound: %v", err)
+		}
+	})
+
+	t.Run("a column that cannot be scanned into its field is an error", func(t *testing.T) {
+		type mismatch struct {
+			ID struct{ X int } `db:"id"` // an int cannot become a struct
+		}
+		if _, err := postgres.Get[mismatch](ctx, c, "SELECT 1 AS id"); err == nil {
+			t.Error("struct Get")
+		}
+		if _, err := postgres.Select[mismatch](ctx, c, "SELECT 1 AS id"); err == nil {
+			t.Error("struct Select")
+		}
+		if _, err := postgres.Get[*mismatch](ctx, c, "SELECT 1 AS id"); err == nil {
+			t.Error("pointer-to-struct Get")
+		}
+		if _, err := postgres.Select[*mismatch](ctx, c, "SELECT 1 AS id"); err == nil {
+			t.Error("pointer-to-struct Select")
+		}
+		if _, err := postgres.Get[time.Time](ctx, c, "SELECT 'text'::text"); err == nil {
+			t.Error("scalar Get")
+		}
+		if _, err := postgres.Select[time.Time](ctx, c, "SELECT 'text'::text"); err == nil {
+			t.Error("scalar Select")
+		}
+		// a single-value type with two columns
+		if _, err := postgres.Get[int](ctx, c, "SELECT 1, 2"); err == nil {
+			t.Error("two columns into one value")
+		}
+	})
+
+	t.Run("a transaction cannot start with a cancelled context", func(t *testing.T) {
+		dead, stop := context.WithCancel(ctx)
+		stop()
+		ran := false
+		if err := c.WithTx(dead, func(postgres.Tx) error { ran = true; return nil }); err == nil || ran {
+			t.Errorf("WithTx: err=%v ran=%v; fn must not run when BEGIN fails", err, ran)
+		}
+		if err := c.WithTxOptions(dead, postgres.TxOptions{}, func(postgres.Tx) error { ran = true; return nil }); err == nil || ran {
+			t.Errorf("WithTxOptions: err=%v ran=%v", err, ran)
+		}
+		if _, err := c.Begin(dead); err == nil {
+			t.Error("Begin")
+		}
+	})
+
+	t.Run("a failing transaction whose rollback also fails reports both", func(t *testing.T) {
+		err := c.WithTx(ctx, func(tx postgres.Tx) error {
+			// Kill our own backend: the statement fails and so will the rollback.
+			_, err := tx.Exec(ctx, "SELECT pg_terminate_backend(pg_backend_pid())")
+			if err == nil {
+				err = errors.New("the backend was not terminated")
+			}
+			return err
+		})
+		if err == nil {
+			t.Fatal("want an error")
+		}
+		if !strings.Contains(err.Error(), "rollback") {
+			t.Fatalf("the error should mention the failed rollback, got %v", err)
+		}
+		must(c.Ping(ctx)) // the pool replaces the dead connection
+	})
+
+	t.Run("Listen failures release the connection", func(t *testing.T) {
+		dead, stop := context.WithCancel(ctx)
+		stop()
+		if _, err := c.Listen(dead, "ch"); err == nil {
+			t.Error("Listen with a cancelled context should fail")
+		}
+
+		// A pool of one connection that the server has killed: Listen acquires the
+		// dead connection and LISTEN fails.
+		victim, err := postgres.New(ctx, postgres.Config{URL: url, MaxConns: 1, AppName: "gcu-listen-victim"})
+		must(err)
+		vc := postgres.Wrap(victim)
+		defer vc.Close()
+		must(vc.Ping(ctx))
+		_, err = c.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'gcu-listen-victim'")
+		must(err)
+		time.Sleep(300 * time.Millisecond)
+		if _, err := vc.Listen(ctx, "ch"); err == nil {
+			t.Error("Listen on a killed connection should fail")
+		}
+		// pgx destroys a broken connection in the background, so poll briefly.
+		deadline := time.Now().Add(5 * time.Second)
+		for vc.Stat().AcquiredConns() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("the failed Listen leaked %d connections", vc.Stat().AcquiredConns())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		must(vc.Ping(ctx)) // and the pool recovers with a fresh connection
+	})
+
+	t.Run("every pool option is applied", func(t *testing.T) {
+		p, err := postgres.New(ctx, postgres.Config{
+			URL: url, MaxConns: 5, MinConns: 1, MaxConnLifetime: time.Hour, MaxConnIdleTime: 30 * time.Minute,
+			HealthCheckPeriod: time.Minute, ConnectTimeout: 5 * time.Second, AppName: "gcu-options",
+		})
+		must(err)
+		defer p.Close()
+		cfg := postgres.Wrap(p).Config()
+		if cfg.MinConns != 1 || cfg.MaxConnLifetime != time.Hour || cfg.MaxConnIdleTime != 30*time.Minute || cfg.HealthCheckPeriod != time.Minute {
+			t.Errorf("options not applied: %+v", cfg)
+		}
+		name, err := postgres.Get[string](ctx, postgres.Wrap(p), "SHOW application_name")
+		must(err)
+		if name != "gcu-options" {
+			t.Errorf("application_name = %q", name)
+		}
+	})
+
+	t.Run("a type that has no array type of its own registers fine", func(t *testing.T) {
+		// int4[] is itself an array type, so it has no further array type to register.
+		p, err := postgres.New(ctx, postgres.Config{URL: url, Types: []string{"int4[]"}})
+		must(err)
+		defer p.Close()
+		ints, err := postgres.Get[[]int32](ctx, postgres.Wrap(p), "SELECT ARRAY[1,2,3]")
+		must(err)
+		if len(ints) != 3 {
+			t.Errorf("ints = %v", ints)
+		}
+	})
+
+	t.Run("type registration failures", func(t *testing.T) {
+		if p, err := postgres.New(ctx, postgres.Config{URL: "postgres://postgres@127.0.0.1:1/x?sslmode=disable", ConnectTimeout: time.Second, Types: []string{"hstore"}}); err == nil {
+			p.Close()
+			t.Error("an unreachable server should fail even with Types set")
+		}
+
+		// A database without the hstore extension: naming it must fail clearly.
+		dbName := fmt.Sprintf("gcu_noext_%d", time.Now().UnixNano())
+		_, err := c.Exec(ctx, "CREATE DATABASE "+dbName)
+		must(err)
+		defer c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
+		u, err := neturl.Parse(url)
+		must(err)
+		u.Path = "/" + dbName
+		p, err := postgres.New(ctx, postgres.Config{URL: u.String(), Types: []string{"hstore"}})
+		if err == nil {
+			p.Close()
+			t.Fatal("hstore without the extension should fail")
+		}
+		if !strings.Contains(err.Error(), "hstore") {
+			t.Errorf("the error should name hstore, got %v", err)
+		}
+	})
+
+	t.Run("a composite with attributes the struct lacks ignores them", func(t *testing.T) {
+		suffix := fmt.Sprint(time.Now().UnixNano())
+		addr := "gcu_wide_" + suffix
+		_, err := c.Exec(ctx, fmt.Sprintf("CREATE TYPE %s AS (street text, zip int, country text)", addr))
+		must(err)
+		defer c.Exec(context.Background(), "DROP TYPE IF EXISTS "+addr)
+		tp, err := postgres.New(ctx, postgres.Config{URL: url, Types: []string{addr}})
+		must(err)
+		tc := postgres.Wrap(tp)
+		defer tc.Close()
+		type narrow struct {
+			Addr struct{ Street string } `db:"addr"`
+		}
+		got, err := postgres.Get[narrow](ctx, tc, fmt.Sprintf("SELECT ROW('Oak', 1, 'NL')::%s AS addr", addr))
+		must(err)
+		if got.Addr.Street != "Oak" {
+			t.Errorf("Street = %q", got.Addr.Street)
 		}
 	})
 }

@@ -170,6 +170,51 @@ Optional: `AppName`, `MaxPoolSize`, `ConnectTimeout`. This is the official drive
 MONGODB_URI=mongodb://app:<password>@mongo.internal:27017/?tls=true&replicaSet=rs0
 ```
 
+For plain methods and the usual conveniences, wrap the client with `mongodb.Wrap`. It adds no schema or repository layer.
+A missing document is `mongodb.ErrNotFound` (use `errors.Is`); documents are decoded with the driver's own `bson` tags:
+
+```go
+c := mongodb.Wrap(mc)                                  // mc from mongodb.New; defer c.Close(ctx)
+users := c.Database("app").Collection("users")
+
+type User struct {
+	ID    bson.ObjectID `bson:"_id,omitempty"`
+	Email string        `bson:"email"`
+	Age   int           `bson:"age"`
+}
+id, err := users.InsertOne(ctx, User{Email: "a@x.io", Age: 30})
+
+var u User
+err = users.Get(ctx, bson.D{{Key: "email", Value: "a@x.io"}}, &u)   // ErrNotFound if none
+var adults []User
+err = users.Find(ctx, bson.D{{Key: "age", Value: bson.D{{Key: "$gte", Value: 18}}}}, &adults,
+	options.Find().SetSort(bson.D{{Key: "age", Value: 1}}))               // or mongodb.Find[User](...)
+
+err = c.WithTx(ctx, func(tx context.Context) error {  // commits on nil, aborts on error
+	_, err := users.UpdateOne(tx, bson.D{{Key: "email", Value: "a@x.io"}}, bson.D{{Key: "$inc", Value: bson.D{{Key: "age", Value: 1}}}})
+	return err                                         // use tx, not ctx, for every operation inside
+})
+if mongodb.IsDuplicateKey(err) { /* unique index violated */ }
+```
+
+| Group | Methods |
+| --- | --- |
+| Client | `Ping` `Close` `Database` `ListDatabaseNames` `ListDatabases` `Watch` `BulkWrite` `StartSession` `UseSession` `UseSessionWithOptions` `NumberSessionsInProgress` `AppendDriverInfo` `WithTx` `WithTxOptions` |
+| Database | `Name` `Collection` `Bucket` `Drop` `CreateCollection` `CreateView` `ListCollectionNames` `ListCollectionSpecifications` `ListCollections` `RunCommand` `RunCommandCursor` `Aggregate` `AggregateCursor` `Watch` |
+| Read | `Get` `Find` `FindCursor` `Exists` `Count` `EstimatedCount` `Distinct` `Aggregate` `AggregateCursor`; generics `mongodb.Get[T]` `Find[T]` `Aggregate[T]` |
+| Write | `InsertOne` `InsertMany` `UpdateOne` `UpdateByID` `UpdateMany` `ReplaceOne` `DeleteOne` `DeleteMany` `FindOneAndUpdate` `FindOneAndReplace` `FindOneAndDelete` `BulkWrite` |
+| Indexes | `CreateIndex` `CreateIndexes` `ListIndexes` `ListIndexSpecifications` `DropIndex` `DropIndexWithKey` `DropAllIndexes` |
+| Change streams | `Watch` on the client, a database or a collection |
+| GridFS files | `db.Bucket()` then `Upload` `UploadWithID` `Download` `DownloadByName` `Rename` `Find` `Delete` `Drop` (streaming and the files and chunks collections via `Bucket.Native`) |
+| Errors | `ErrNotFound` `IsDuplicateKey` `IsTimeout` `IsNetworkError` `IsTransient` `IsWriteConflict` `IsNamespaceNotFound` `HasCode` `HasLabel` |
+
+Notes: transactions and change streams need a replica set or sharded cluster. `WithTx` follows the driver, which retries the
+whole function on transient errors and retries an uncertain commit for up to about two minutes, so the function must be safe to
+run more than once. `DeleteMany` with a nil filter deletes every document, and `Drop` removes data; both are marked "Dangerous"
+in their docs. Atlas Search indexes, `Collection.Clone`, and streaming GridFS uploads and downloads are reachable through the
+`Native` field. Every driver method has a wrapper or a documented reason it does not, a test enforces that, and every wrapper
+is called by at least one test.
+
 ### Redis
 
 `URL` is `redis://[user:password@]host:port/db`, or `rediss://` for TLS (certificates are verified).

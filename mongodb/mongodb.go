@@ -13,6 +13,11 @@
 //	}
 //	defer client.Disconnect(context.Background())
 //
+// Wrap(client) returns a Client with plain methods for the driver's database,
+// collection, index, change-stream, transaction and GridFS operations, decoding
+// into structs and mapping a missing document to ErrNotFound. The driver client
+// stays reachable as Client.Native.
+//
 // TLS is controlled by the URI (tls=true or a mongodb+srv:// URI). The package
 // offers no option to skip certificate checks.
 package mongodb
