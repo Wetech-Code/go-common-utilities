@@ -12,6 +12,10 @@
 //	}
 //	defer rdb.Close()
 //
+// Wrap(rdb) returns a Client with plain (value, error) methods for the common
+// operations (strings, keys, hashes, lists, sets, sorted sets, pub/sub, pipelines);
+// the full go-redis client stays available as Client.Native.
+//
 // Use a rediss:// URL for TLS. Certificates are verified against the host in the
 // URL; the package offers no option to skip verification.
 package redis
