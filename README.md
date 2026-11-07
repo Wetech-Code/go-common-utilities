@@ -228,6 +228,16 @@ One tag covers all six packages. There is no registry or package server; `go get
 
 ## Contributing
 
+Enable the pre-commit hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+When Go or module files are staged it runs `gofmt`, `go mod tidy` consistency (if `go.mod`/`go.sum` changed),
+`go vet` and the unit tests, and blocks the commit if any fail. It skips commits that touch no Go files, and
+`git commit --no-verify` bypasses it for one commit. The full gate is still `scripts/check.sh`.
+
 Open a pull request from a branch; don't push to `main`. Keep the scope small: a new helper needs a concrete consumer
 and a review before it is added (requirement GCU-14). A new package needs a documented API, unit tests, an example and,
 for a network service, an opt-in integration test. Run the commands under "Run the tests" and `gofmt -l .` before pushing.
