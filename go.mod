@@ -2,6 +2,8 @@ module github.com/Wetech-Code/go-common-utilities
 
 go 1.26.10
 
+toolchain go1.27.3
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.8
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.16

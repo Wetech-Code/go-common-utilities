@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 echo "== gofmt";        test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-echo "== go mod tidy";  go mod tidy; git diff --exit-code go.mod go.sum
+echo "== go mod tidy";  go mod tidy -diff
 echo "== go mod verify"; go mod verify
 echo "== go vet";       go vet ./... && go vet -tags integration ./...
 echo "== go test -race"; go test -race -count=1 ./...
