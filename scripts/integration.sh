@@ -12,7 +12,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 command -v docker >/dev/null || { echo "Docker is required for this script." >&2; exit 1; }
 docker compose version >/dev/null || { echo "The docker compose plugin is required." >&2; exit 1; }
 
-dir="$(mktemp -d)"
+# Inside the repo (gitignored), not /tmp or /var/folders: Colima, Lima and similar
+# engines only share your home directory with the VM, and a bind mount of an
+# unshared path silently becomes an empty directory.
+dir="$(mktemp -d "$PWD/.integration-XXXXXX")"
 cleanup() { docker compose down -v >/dev/null 2>&1 || true; rm -rf "$dir"; }
 trap cleanup EXIT
 
