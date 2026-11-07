@@ -197,6 +197,10 @@ Chosen and verified on 2026-11-07.
 | `github.com/aws/aws-sdk-go-v2` / `service/s3` / `credentials` | v1.47.8 / v1.114.9 / v1.20.16 |
 | SeaweedFS (integration tested) | 4.52 |
 
+`go.mod` has a `toolchain go1.27.3` line, so inside this repo Go downloads and uses 1.27.3 automatically (consumers only
+need the 1.26.10 minimum). Use Go 1.27.3+ or 1.26.10+ for your own builds: 1.27.1 has standard-library advisories, and
+`govulncheck` run with it reports them even though the library code is fine.
+
 Integration tests were run on 2026-11-07 against PostgreSQL 16.14, MongoDB 8.3.4, Redis 8.8.0 and SeaweedFS 4.52
 (installed locally with Homebrew), and all passed. Compatibility is only claimed for what those tests
 ran; other server versions are untested. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
