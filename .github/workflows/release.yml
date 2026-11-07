@@ -1,0 +1,86 @@
+name: release
+
+# Manual only: nothing runs on push, pull request or a schedule, and no tests run
+# here. Run scripts/check.sh and scripts/integration.sh on your machine first.
+# To publish: Actions tab, "release", Run workflow, branch main, pick a release
+# type (auto reads the commit messages since the last tag). The job works out the
+# next version from the latest tag, tags that commit and creates the GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "auto = pick patch/minor/major from commit messages. Or force patch/minor/major. (first release is always v0.1.0)"
+        required: true
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+
+permissions:
+  contents: read
+
+jobs:
+  # Tags and publishes. Runs no repository scripts or third-party Go code, and the
+  # write token is passed only to the two steps that need it. No tests run here:
+  # run scripts/check.sh and scripts/integration.sh yourself before releasing.
+  release:
+    name: release (${{ inputs.release }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the GitHub release
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the token is given to the push step explicitly
+          fetch-depth: 0 # auto needs the commits since the last tag
+      - name: Work out the next version from the latest tag
+        id: next
+        env:
+          BUMP: ${{ inputs.release }}
+        run: |
+          git fetch --tags --quiet
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest" ]; then
+            next="v0.1.0" # nothing published yet
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            if [ "$BUMP" = auto ]; then
+              if [ "$(git rev-list --count "$latest"..HEAD)" = 0 ]; then
+                echo "No commits since $latest; nothing to release." >&2; exit 1
+              fi
+              log="$(git log "$latest"..HEAD --format='%s%n%b')"
+              # Conventional commits: "type!:" or a BREAKING CHANGE footer = breaking, "feat:" = feature, anything else = fix.
+              if grep -Eq '^[a-z]+(\([^)]*\))?!:|^BREAKING CHANGE' <<< "$log"; then BUMP=major
+              elif grep -Eq '^feat(\([^)]*\))?:' <<< "$log"; then BUMP=minor
+              else BUMP=patch; fi
+              # Before 1.0 a breaking change is a minor bump; going to v1.0.0 must be chosen explicitly.
+              if [ "$BUMP" = major ] && [ "$major" = 0 ]; then BUMP=minor; fi
+              echo "auto picked: $BUMP"
+            fi
+            case "$BUMP" in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v${major}.$((minor + 1)).0" ;;
+              patch) next="v${major}.${minor}.$((patch + 1))" ;;
+            esac
+          fi
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "$next already exists; tags are never moved." >&2; exit 1
+          fi
+          echo "latest tag: ${latest:-none}  ->  releasing: $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+      - name: Tag the commit
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$VERSION"
+      - name: Create the GitHub release
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION" --title "$VERSION" --generate-notes

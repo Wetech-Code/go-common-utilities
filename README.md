@@ -151,21 +151,21 @@ anywhere in this module.
 
 ## Run the tests
 
+Tests run on your machine; the GitHub workflow only publishes releases and runs no tests.
+
 ```sh
-go vet ./...
-go test -race ./...                      # unit tests, no services needed
-scripts/consumer-check.sh                # builds a separate throwaway module that imports all six packages
-scripts/check.sh                         # everything above plus gofmt, go mod tidy/verify and govulncheck
-scripts/seaweedfs-test.sh                # SeaweedFS in Docker: s3 integration test + consumer check
+scripts/check.sh          # gofmt, go mod tidy/verify, go vet, go test -race, consumer build, govulncheck
+scripts/integration.sh    # Docker: real PostgreSQL, MongoDB, Redis and SeaweedFS, then the consumer check
 ```
 
-Nothing runs automatically. `scripts/check.sh` is the gate, run by the author and reviewer before merging. The same
-checks, plus the PostgreSQL, MongoDB, Redis and SeaweedFS integration tests in containers, are available as a GitHub
-Actions workflow that only starts when you trigger it by hand: Actions tab, "ci", "Run workflow", or
-`gh workflow run ci.yml --ref <branch>` (GitHub only offers it once the file is on the default branch).
+`scripts/check.sh` needs only Go. `scripts/integration.sh` needs Docker with the compose plugin. It creates random
+throwaway S3 credentials, starts the containers in [`docker-compose.yml`](docker-compose.yml) (bound to `127.0.0.1` on
+unusual ports so they do not clash with servers you already run), runs the tests, prints the server versions, and removes
+the containers afterwards. A skipped integration test counts as a failure. To keep the servers up while you work, use
+`docker compose` yourself (`GCU_S3_CONFIG` must point to an S3 identity file, see the script).
 
-Integration tests are opt-in: they need the `integration` build tag and a disposable service, and each one is skipped
-(and reported as skipped with `-v`) when its variable is unset.
+Integration tests are opt-in: they need the `integration` build tag, and each one is skipped (and reported as skipped
+with `-v`) when its variable is unset. You can point them at servers you already run instead of Docker:
 
 | Package | Variables |
 | --- | --- |
@@ -175,13 +175,6 @@ Integration tests are opt-in: they need the `integration` build tag and a dispos
 | s3 | `GCU_TEST_S3_ENDPOINT`, `GCU_TEST_S3_ACCESS_KEY`, `GCU_TEST_S3_SECRET_KEY`, optional `GCU_TEST_S3_BUCKET` (default `gcu-test`, created if missing) |
 
 ```sh
-# Example with Docker (all disposable; use throwaway credentials only)
-docker run -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18
-docker run -d -p 27017:27017 mongo:8.0
-docker run -d -p 6379:6379 redis:8
-# SeaweedFS needs an S3 identity file (or `brew install seaweedfs` and `weed server -s3 -s3.config=...`); scripts/seaweedfs-test.sh starts one in Docker and runs the s3 test for you
-# (the manual "ci" workflow does the same).
-
 GCU_TEST_POSTGRES_URL='postgres://postgres@localhost:5432/postgres?sslmode=disable' \
 GCU_TEST_MONGODB_URI='mongodb://localhost:27017/?directConnection=true' \
 GCU_TEST_REDIS_URL='redis://localhost:6379/0' \
@@ -190,7 +183,6 @@ go test -tags integration -race -count=1 -v -run Integration ./...
 
 Never point integration tests at a shared or production system: they create and delete their own uniquely named
 collections, keys and objects, but they are still tests.
-
 
 ## Versions
 
@@ -206,7 +198,7 @@ Chosen and verified on 2026-11-07.
 | SeaweedFS (integration tested) | 4.52 |
 
 Integration tests were run on 2026-11-07 against PostgreSQL 16.14, MongoDB 8.3.4, Redis 8.8.0 and SeaweedFS 4.52
-(all installed locally with Homebrew, no Docker), and all passed. Compatibility is only claimed for what those tests
+(installed locally with Homebrew), and all passed. Compatibility is only claimed for what those tests
 ran; other server versions are untested. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
 rejection. Multipart upload, listing and tagging are not covered.
 
@@ -215,15 +207,16 @@ rejection. Multipart upload, listing and tagging are not covered.
 Releases are ordinary Git tags following [semantic versioning](https://semver.org): `v0.1.0`, `v0.1.1`, `v0.2.0`, ...
 One tag covers all six packages. There is no registry or package server; `go get` fetches the tag from GitHub.
 
-- **Release:** after a pull request is reviewed and merged, and `scripts/check.sh` passes on `main`, a maintainer
-  publishes from the Actions tab: run the "ci" workflow on `main` and choose `release`: `auto`, `patch`, `minor` or
-  `major` (`none` only runs the checks). `auto` reads the commit messages since the last tag: `type!:` or a
-  `BREAKING CHANGE` footer means major, `feat:` means minor, anything else patch. Before 1.0 a breaking change gives
-  a minor bump, and `v1.0.0` must be chosen explicitly with `major`. `auto` fails if nothing changed since the last tag. The workflow works out the next version from the latest tag (the first release is
-  always `v0.1.0`), re-runs every check and integration test, and only then creates the tag and the GitHub release and
-  installs the new tag from a clean consumer module. By hand, the equivalent is
-  `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` plus `gh release create v0.1.0`. Tags are never
-  moved or deleted; a bad release is fixed by publishing the next patch version.
+- **Release:** first run `scripts/check.sh` and `scripts/integration.sh` on `main` (nothing in GitHub runs tests).
+  Then publish from the Actions tab: run the "release" workflow on `main` and choose `auto`, `patch`, `minor` or
+  `major`. `auto` reads the commit messages since the last tag: `type!:` or a `BREAKING CHANGE` footer means major,
+  `feat:` means minor, anything else patch. Before 1.0 a breaking change gives a minor bump, and `v1.0.0` must be chosen
+  explicitly with `major`. `auto` fails if nothing changed since the last tag. The workflow works out the version from
+  the latest tag (the first release is always `v0.1.0`), creates the tag and the GitHub release with generated notes,
+  and does nothing else. By hand, the equivalent is
+  `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` plus `gh release create v0.1.0`. Then confirm the tag
+  installs: `CONSUMER_VERSION=v0.1.0 scripts/consumer-check.sh`. Tags are never moved or deleted; a bad release is
+  fixed by publishing the next patch version.
 - **Before 1.0**, a minor bump (`v0.1` → `v0.2`) may change an API; patch bumps (`v0.1.0` → `v0.1.1`) will not. Release
   notes list every breaking change.
 - **Upgrade a consumer:** `go get github.com/Wetech-Code/go-common-utilities@v0.2.0 && go mod tidy`, then run your tests.
