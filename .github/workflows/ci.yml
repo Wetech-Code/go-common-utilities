@@ -2,17 +2,18 @@ name: ci
 
 # Manual only: runs when someone clicks "Run workflow" (or `gh workflow run ci.yml`).
 # It never runs on push, pull request or a schedule.
-# To publish, run it from main and fill in release_version (for example v0.1.0).
-# The release job then tags that commit and creates the GitHub release, but only
-# after every check and integration test below has passed.
+# To publish, run it from main and pick a release type. The release job works out
+# the next version from the latest tag, tags that commit and creates the GitHub
+# release, but only after every check and integration test below has passed.
 on:
   workflow_dispatch:
     inputs:
-      release_version:
-        description: "Leave empty to only run checks. Or a new version to publish, like v0.1.0"
-        required: false
-        default: ""
-        type: string
+      release:
+        description: "none = checks only. patch/minor/major = publish the next version (first release is always v0.1.0)"
+        required: true
+        default: none
+        type: choice
+        options: [none, patch, minor, major]
 
 permissions:
   contents: read
@@ -136,41 +137,82 @@ jobs:
       - name: Independent consumer talks to every service
         run: scripts/consumer-check.sh
 
+  # Tags and publishes. Runs no repository scripts or third-party Go code, and the
+  # write token is passed only to the two steps that need it.
   release:
-    name: release ${{ inputs.release_version }}
-    if: inputs.release_version != '' && github.ref == 'refs/heads/main'
+    name: release (${{ inputs.release }})
+    if: inputs.release != 'none' && github.ref == 'refs/heads/main'
     needs: [check, vulncheck, integration]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the tag and the GitHub release
-    env:
-      VERSION: ${{ inputs.release_version }}
-      GH_TOKEN: ${{ github.token }}
+    outputs:
+      version: ${{ steps.next.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true # needed to push the tag
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.3"
-      - name: Check the version is new and well formed
+          persist-credentials: false # the token is given to the push step explicitly
+      - name: Work out the next version from the latest tag
+        id: next
         run: |
-          if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "release_version must look like v0.1.0" >&2; exit 1
-          fi
           git fetch --tags --quiet
-          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
-            echo "$VERSION already exists; tags are never moved. Pick the next version." >&2; exit 1
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest" ]; then
+            next="v0.1.0" # nothing published yet
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            case "${{ inputs.release }}" in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v${major}.$((minor + 1)).0" ;;
+              patch) next="v${major}.${minor}.$((patch + 1))" ;;
+            esac
           fi
-      - name: Tag and create the GitHub release
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "$next already exists; tags are never moved." >&2; exit 1
+          fi
+          echo "latest tag: ${latest:-none}  ->  releasing: $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+      - name: Tag the commit
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$VERSION" -m "$VERSION"
-          git push origin "$VERSION"
-          gh release create "$VERSION" --title "$VERSION" --generate-notes
-      - name: Consumer installs the published tag
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$VERSION"
+      - name: Create the GitHub release
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION" --title "$VERSION" --generate-notes
+
+  # Proves the new tag installs from a clean module. Read-only token, and the git
+  # credential is removed before any downloaded code is built or run.
+  verify-release:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      GOPRIVATE: github.com/Wetech-Code/*
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: Download the private module with the read-only token, then drop the token
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          go env -w GOPRIVATE='github.com/Wetech-Code/*'
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          CONSUMER_VERSION="$VERSION" scripts/consumer-check.sh
+          tmp="$(mktemp -d)"; cd "$tmp"
+          go mod init example.com/prefetch
+          go get "github.com/Wetech-Code/go-common-utilities@${VERSION}"   # fills the module cache
+          git config --global --unset-all url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf
+          ! git config --global --get-regexp '^url\.' # nothing left behind
+      - name: Consumer builds and runs against the cached tag
+        run: CONSUMER_VERSION="$VERSION" scripts/consumer-check.sh
