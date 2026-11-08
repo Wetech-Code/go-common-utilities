@@ -1,6 +1,7 @@
 package jwt_test
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -663,3 +664,52 @@ func FuzzVerify(f *testing.F) {
 }
 
 func bigOne() *big.Int { return big.NewInt(1) }
+
+type fakeSource struct {
+	key  crypto.PublicKey
+	err  error
+	kids []string
+}
+
+func (f *fakeSource) PublicKey(_ context.Context, kid string) (crypto.PublicKey, error) {
+	f.kids = append(f.kids, kid)
+	return f.key, f.err
+}
+
+func TestKeySourceIsConsultedWithTheTokensKid(t *testing.T) {
+	src := &fakeSource{key: &rsaKey2048.PublicKey}
+	c, err := jwt.New(jwt.Config{Algorithm: "RS256", KeySource: src, Now: fixed})
+	must(t, err)
+	signer, _ := jwt.New(jwt.Config{Algorithm: "RS256", Key: jwt.Key{ID: "k-7", Private: rsaKey2048}, TTL: time.Minute, Now: fixed})
+	tok, _ := signer.Sign(jwt.Claims{})
+	if _, err := c.VerifyContext(context.Background(), tok); err != nil {
+		t.Fatal(err)
+	}
+	noKid, _ := jwt.New(jwt.Config{Algorithm: "RS256", Key: jwt.Key{Private: rsaKey2048}, TTL: time.Minute, Now: fixed})
+	tok2, _ := noKid.Sign(jwt.Claims{})
+	if _, err := c.Verify(tok2); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(src.kids, []string{"k-7", ""}) {
+		t.Errorf("kids asked for = %q", src.kids)
+	}
+
+	// A source error is a verification failure that does not echo the source's message.
+	src.err = errors.New("db password hunter2 wrong")
+	if _, err := c.Verify(tok); !errors.Is(err, jwt.ErrInvalid) || strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("source error: %v", err)
+	}
+	// So does a key of the wrong type.
+	src.err, src.key = nil, p256.Public()
+	if _, err := c.Verify(tok); !errors.Is(err, jwt.ErrInvalid) {
+		t.Errorf("wrong key type from the source: %v", err)
+	}
+	// A non-string kid is refused before the source is asked.
+	bad := gjwt.NewWithClaims(gjwt.SigningMethodRS256, gjwt.MapClaims{"exp": now.Add(time.Hour).Unix()})
+	bad.Header["kid"] = 9
+	s, _ := bad.SignedString(rsaKey2048)
+	n := len(src.kids)
+	if _, err := c.Verify(s); !errors.Is(err, jwt.ErrInvalid) || len(src.kids) != n {
+		t.Errorf("numeric kid: %v (source asked %d times)", err, len(src.kids)-n)
+	}
+}

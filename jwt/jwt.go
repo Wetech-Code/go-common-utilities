@@ -33,6 +33,7 @@
 package jwt
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -85,6 +86,15 @@ type Key struct {
 	Public  crypto.PublicKey
 }
 
+// KeySource supplies verification keys by key ID, for keys that live outside
+// your configuration, such as an identity provider's published key set (see
+// package jwt/jwks). kid is the token's kid header, or "" if it has none.
+// Implementations must be safe for concurrent use, and should return an error
+// rather than guess when they cannot find a key.
+type KeySource interface {
+	PublicKey(ctx context.Context, kid string) (crypto.PublicKey, error)
+}
+
 // Config describes how tokens are signed and verified.
 type Config struct {
 	// Algorithm is required: HS256, HS384, HS512, RS256, RS384, RS512, PS256, PS384,
@@ -96,6 +106,11 @@ type Config struct {
 	// a rotation. Each needs an ID, different from the others and from Key.ID, and
 	// the token's kid header selects it.
 	OldKeys []Key
+	// KeySource, if set, replaces Key and OldKeys: the Codec only verifies, with
+	// keys looked up by the token's kid. The algorithm is still fixed by Algorithm,
+	// and every key the source returns is checked against it like a configured key
+	// (type, RSA size, curve).
+	KeySource KeySource
 	// Issuer is written as iss when signing and required when verifying.
 	// Audience is written as aud when signing (unless the Claims set their own)
 	// and, when verifying, at least one entry must appear in the token's aud.
@@ -146,6 +161,7 @@ var methods = map[string]gjwt.SigningMethod{
 
 // Codec signs and verifies tokens. It is safe for concurrent use.
 type Codec struct {
+	source   KeySource
 	cfg      Config
 	method   gjwt.SigningMethod
 	signKey  any // nil when verify-only
@@ -187,6 +203,16 @@ func (cfg Config) build() (*Codec, error) {
 	}
 
 	c := &Codec{cfg: cfg, method: method, verify: map[string]any{}}
+	if cfg.KeySource != nil {
+		if cfg.Key.ID != "" || len(cfg.Key.Secret) > 0 || cfg.Key.Private != nil || cfg.Key.Public != nil || len(cfg.OldKeys) > 0 {
+			return nil, fmt.Errorf("%w: KeySource replaces Key and OldKeys; set only one of them", ErrConfig)
+		}
+		if strings.HasPrefix(cfg.Algorithm, "HS") {
+			return nil, fmt.Errorf("%w: KeySource supplies public keys and cannot be used with HMAC algorithms", ErrConfig)
+		}
+		c.source = cfg.KeySource
+		return c, nil
+	}
 	primary, signKey, err := keyFor(cfg.Algorithm, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: Key: %s", ErrConfig, err)
@@ -341,7 +367,8 @@ func ed25519Key(alg string, private crypto.PrivateKey, public crypto.PublicKey) 
 	return pub, nil, nil
 }
 
-// Sign returns a signed token for c using Config.TTL, which must be set.
+// Sign returns a signed token for c using Config.TTL, which must be set. It
+// returns ErrNoSigningKey on a Codec that only verifies.
 func (cd *Codec) Sign(c Claims) (string, error) { return cd.SignWithTTL(c, cd.cfg.TTL) }
 
 // SignWithTTL is Sign with a lifetime other than Config.TTL, for example a
@@ -402,6 +429,12 @@ func (cd *Codec) SignWithTTL(c Claims, ttl time.Duration) (string, error) {
 // ErrNotYetValid or ErrInvalid (check with errors.Is); the error never contains
 // the token or any claim.
 func (cd *Codec) Verify(token string) (*Claims, error) {
+	return cd.VerifyContext(context.Background(), token)
+}
+
+// VerifyContext is Verify with a context, which bounds a lookup in a KeySource
+// (for example a fetch of a remote key set).
+func (cd *Codec) VerifyContext(ctx context.Context, token string) (*Claims, error) {
 	if len(token) > cd.cfg.MaxTokenSize {
 		return nil, fmt.Errorf("%w: token is larger than %d bytes", ErrInvalid, cd.cfg.MaxTokenSize)
 	}
@@ -418,7 +451,7 @@ func (cd *Codec) Verify(token string) (*Claims, error) {
 		opts = append(opts, gjwt.WithIssuer(cd.cfg.Issuer))
 	}
 	m := gjwt.MapClaims{}
-	if _, err := gjwt.NewParser(opts...).ParseWithClaims(token, m, cd.keyFunc); err != nil {
+	if _, err := gjwt.NewParser(opts...).ParseWithClaims(token, m, func(t *gjwt.Token) (any, error) { return cd.keyFunc(ctx, t) }); err != nil {
 		return nil, classify(err)
 	}
 	if len(cd.cfg.Audience) > 0 {
@@ -430,14 +463,25 @@ func (cd *Codec) Verify(token string) (*Claims, error) {
 	return claimsFrom(m), nil
 }
 
-func (cd *Codec) keyFunc(t *gjwt.Token) (any, error) {
+func (cd *Codec) keyFunc(ctx context.Context, t *gjwt.Token) (any, error) {
 	raw, has := t.Header["kid"]
+	kid, isString := raw.(string)
+	if has && !isString {
+		return nil, errors.New("kid is not a string")
+	}
+	if cd.source != nil {
+		pub, err := cd.source.PublicKey(ctx, kid)
+		if err != nil {
+			return nil, errors.New("no key for this token")
+		}
+		verify, _, err := keyFor(cd.cfg.Algorithm, Key{Public: pub})
+		if err != nil {
+			return nil, errors.New("key does not suit the algorithm")
+		}
+		return verify, nil
+	}
 	if !has {
 		return cd.fallback, nil
-	}
-	kid, ok := raw.(string)
-	if !ok {
-		return nil, errors.New("kid is not a string")
 	}
 	key, found := cd.verify[kid]
 	if !found {
