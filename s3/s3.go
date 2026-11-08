@@ -1,9 +1,11 @@
 // Package s3 wraps the AWS SDK for Go v2 S3 client for S3-compatible storage,
 // in particular the SeaweedFS S3 gateway, and adds a few object helpers.
 //
-// A Client is bound to one bucket. The native SDK client is exported as
-// Client.S3, so any S3 operation the helpers do not cover (listing, multipart
-// upload, tagging, ...) is still available.
+// A Client is bound to one bucket. It has plain helpers for the common work
+// (Put, Get, Head, List, Copy, Upload, DeleteMany, tags, presigned URLs) and a
+// method for every operation of the SDK's S3 client, which takes the SDK's input
+// struct with the bucket filled in. The native SDK client is also exported as
+// Client.S3. Wrap builds a Client around an SDK client you already have.
 //
 //	c, err := s3.New(ctx, s3.Config{
 //		Endpoint:        "https://seaweed.internal:8333",
@@ -20,6 +22,8 @@
 // Certificates are always verified; the package offers no option to skip that.
 // Authorization (who may read or write which key) is the caller's concern.
 package s3
+
+//go:generate go run ../internal/gens3 -out client_gen.go
 
 import (
 	"context"
@@ -158,7 +162,11 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Close releases idle network connections. The Client must not be used for new
 // requests afterwards.
-func (c *Client) Close() { c.http.CloseIdleConnections() }
+func (c *Client) Close() {
+	if c.http != nil {
+		c.http.CloseIdleConnections()
+	}
+}
 
 // Put uploads body as key with the given content type (empty means the service
 // default). The body must be seekable so the request can be signed and retried;
@@ -276,11 +284,21 @@ func checkExpiry(d time.Duration) error {
 	return nil
 }
 
+// opError adds the operation name to err. For object-level operations, a
+// missing key or version is reported so that errors.Is(err, ErrNotFound) holds
+// while the SDK error stays reachable through errors.As.
+func opError(op string, err error) error {
+	if strings.Contains(op, "Object") && isNotFound(err) {
+		return fmt.Errorf("%w: %s: %w", ErrNotFound, op, err)
+	}
+	return fmt.Errorf("s3: %s: %w", op, err)
+}
+
 func isNotFound(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "NoSuchKey", "NotFound":
+		case "NoSuchKey", "NotFound", "NoSuchVersion":
 			return true
 		}
 	}
