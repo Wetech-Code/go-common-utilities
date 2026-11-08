@@ -8,7 +8,7 @@ Module: `github.com/Wetech-Code/go-common-utilities` · Go 1.26.10 or newer
 
 | Package | What it gives you | Native type you get back |
 | --- | --- | --- |
-| [`config`](config) | Read env vars as string/int/bool/duration/list, collect all errors, require values | — |
+| [`config`](config) | Read env vars (and `.env` files, Docker/Kubernetes secret files) as typed values, load a whole struct from tags, collect every error at once | — |
 | [`logger`](logger) | `*slog.Logger` from a small config; JSON or text; redacts password/token/secret keys; fans out to extra sinks | `*slog.Logger` |
 | [`logger/loki`](logger/loki) | Handler that pushes logs to Grafana Loki (stdlib only) | `slog.Handler` |
 | [`telemetry`](telemetry) | One setup for logs, traces and metrics over OTLP (Grafana Loki/Tempo/Prometheus, Grafana Cloud, Collector, ...); HTTP server and client instrumentation | `trace.Tracer`, `metric.Meter`, `slog.Handler` |
@@ -93,6 +93,57 @@ log.Info("connected")
 ```
 
 Each package has a runnable example in its `example_test.go` and full documentation via `go doc`, e.g. `go doc -all ./s3`.
+
+### Config
+
+`config.New()` reads environment variables into typed values, remembers every problem, and reports them all at once with
+`Err()`. An empty variable counts as unset, and error messages name the variable but never its value (it may be a secret).
+
+```go
+r := config.New()
+dsn := r.URL("DATABASE_URL", "", "postgres", "postgresql") // absolute URL with an allowed scheme
+port := r.IntRange("PORT", 8080, 1, 65535)
+level := r.Enum("LOG_LEVEL", "info", "debug", "info", "warn", "error")
+limit := r.Bytes("MAX_UPLOAD", 10<<20)                      // "10MiB", "512KB", "1048576"
+labels := r.Map("LABELS", nil)                              // "env=prod,team=ops"
+if r.Bool("TLS", false) && !r.Has("TLS_CERT") {
+	r.Invalid("TLS_CERT", "set when TLS is enabled")        // your own cross-field checks
+}
+if err := r.Err(); err != nil { return err }               // every missing or invalid setting, together
+```
+
+| Group | Methods |
+| --- | --- |
+| Basic | `Require` `String` `Int` `Bool` `Duration` `Strings` `Has` |
+| More types | `Int64` `Uint` `Float64` `Bytes` `URL` `Map` `Enum` |
+| Bounds | `IntRange` `DurationRange` |
+| Your own checks | `Invalid` |
+| Sources | `New` (environment), `FromMap` (tests), `FromFile` (a `.env` file under the real environment), `WithPrefix("APP_")`, `WithFileSecrets()` |
+| Struct | `Load(&cfg)` |
+
+Load a whole struct from tags; every problem still lands in the same `Err()`:
+
+```go
+type Settings struct {
+	Port    int           `env:"PORT" default:"8080" min:"1" max:"65535"`
+	DSN     string        `env:"DATABASE_URL" required:"true"`
+	Level   string        `env:"LOG_LEVEL" default:"info" enum:"debug,info,warn,error"`
+	Timeout time.Duration `env:"TIMEOUT" default:"30s" max:"5m"`
+	Redis   struct {
+		URL string `env:"URL" required:"true"` // read as REDIS_URL
+	} `envPrefix:"REDIS_"`
+}
+var s Settings
+r := config.New().WithPrefix("APP_").WithFileSecrets() // APP_PORT, and APP_DATABASE_URL_FILE=/run/secrets/db
+r.Load(&s)
+```
+
+Supported field types: string, bool, int and uint of every size, floats, `time.Duration`, `[]string`, `map[string]string` and
+nested structs. `WithFileSecrets` makes an unset `KEY` fall back to the file named by `KEY_FILE`
+(Docker and Kubernetes secrets; the variable wins if both are set; files over 1 MiB are refused). `FromFile` is for local
+development: `KEY=VALUE` lines, `#` comments, `export`, single quotes (literal) and double quotes (`\n`, `\t`, `\"`, `\\`
+escapes), no variable expansion; real environment variables always override the file, and nothing reads a file unless you call it.
+Not included, on purpose: JSON, YAML or TOML files, hot reload, and remote configuration servers.
 
 ### Logger: console, Grafana Loki, OpenTelemetry
 
