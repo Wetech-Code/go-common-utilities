@@ -46,6 +46,10 @@ type Config struct {
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	// Hooks are added to the client before it connects. Use otelredis.New from the
+	// telemetry/otelredis package for OpenTelemetry spans and metrics, or any
+	// go-redis Hook of your own.
+	Hooks []goredis.Hook
 }
 
 // Validate reports problems with the configuration without connecting.
@@ -91,6 +95,9 @@ func New(ctx context.Context, cfg Config) (*goredis.Client, error) {
 	}
 
 	client := goredis.NewClient(opts)
+	for _, h := range cfg.Hooks {
+		client.AddHook(h)
+	}
 	pingCtx, cancel := context.WithTimeout(ctx, opts.DialTimeout)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {

@@ -63,6 +63,11 @@ type Config struct {
 	// A missing type, or a missing hstore extension, makes New fail at startup.
 	// Built-in types need no registration.
 	Types []string
+
+	// Tracer, if set, observes every query, batch, COPY and connection on the
+	// pool. Use otelpgx.New from the telemetry/otelpgx package for OpenTelemetry
+	// spans and metrics, or any pgx.QueryTracer of your own.
+	Tracer pgx.QueryTracer
 }
 
 // Validate reports problems with the configuration without connecting.
@@ -125,6 +130,9 @@ func New(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 
 	if len(cfg.Types) > 0 {
 		pc.AfterConnect = registerTypes(cfg.Types)
+	}
+	if cfg.Tracer != nil {
+		pc.ConnConfig.Tracer = cfg.Tracer
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, pc)

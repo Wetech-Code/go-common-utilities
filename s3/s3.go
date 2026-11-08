@@ -39,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 )
 
 // Defaults applied when the matching Config field is zero.
@@ -70,6 +71,10 @@ type Config struct {
 	UsePathStyle bool
 	// ConnectTimeout bounds the startup check. Default DefaultConnectTimeout.
 	ConnectTimeout time.Duration
+	// APIOptions are added to every request's middleware stack. Use
+	// otels3.APIOptions from the telemetry/otels3 package for OpenTelemetry
+	// spans and metrics, or any smithy middleware of your own.
+	APIOptions []func(*middleware.Stack) error
 }
 
 // Validate reports problems with the configuration without connecting.
@@ -136,6 +141,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Endpoint != "" {
 		opts.BaseEndpoint = aws.String(cfg.Endpoint)
 	}
+	opts.APIOptions = append(opts.APIOptions, cfg.APIOptions...)
 	native := awss3.New(opts)
 	c := &Client{S3: native, Bucket: cfg.Bucket, presign: awss3.NewPresignClient(native), http: hc}
 

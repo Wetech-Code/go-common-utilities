@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the integration tests for all four providers against disposable Docker
-# containers (docker-compose.yml), then the independent consumer check, then
+# Runs the integration tests for all providers (PostgreSQL, MongoDB, Redis, SeaweedFS,
+# Loki, Tempo, Prometheus and Grafana) against disposable Docker containers (docker-compose.yml), then the independent consumer check, then
 # removes the containers. Needs Docker with the compose plugin, curl, openssl, Go.
 #
 #   scripts/integration.sh
@@ -25,14 +25,30 @@ cat > "$dir/s3.json" <<JSON
 {"identities":[{"name":"test","credentials":[{"accessKey":"$access","secretKey":"$secret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
 JSON
 export GCU_S3_CONFIG="$dir/s3.json"
+GCU_GRAFANA_PASSWORD="$(openssl rand -hex 12)"
+export GCU_GRAFANA_PASSWORD
 
 echo "== starting containers"
-docker compose up -d --wait postgres mongodb redis seaweedfs
+docker compose up -d --wait postgres mongodb redis seaweedfs loki tempo prometheus grafana
 
 echo "== waiting for the SeaweedFS S3 gateway"
 for i in $(seq 1 60); do
   if curl -s http://localhost:9333/dir/assign | grep -q '"fid"' && curl -s -o /dev/null http://localhost:8333/; then break; fi
   if [ "$i" = 60 ]; then docker compose logs seaweedfs | tail -50; echo "SeaweedFS not ready" >&2; exit 1; fi
+  sleep 1
+done
+
+echo "== waiting for Loki"
+for i in $(seq 1 90); do
+  if curl -s http://localhost:13100/ready | grep -q '^ready'; then break; fi
+  if [ "$i" = 90 ]; then docker compose logs loki | tail -30; echo "Loki not ready" >&2; exit 1; fi
+  sleep 1
+done
+
+echo "== waiting for Tempo and Prometheus"
+for i in $(seq 1 120); do
+  if curl -s http://localhost:13200/ready | grep -q '^ready' && curl -s http://localhost:19090/-/ready | grep -qi 'ready'; then break; fi
+  if [ "$i" = 120 ]; then docker compose logs tempo prometheus | tail -40; echo "Tempo or Prometheus not ready" >&2; exit 1; fi
   sleep 1
 done
 
@@ -50,6 +66,11 @@ export GCU_TEST_REDIS_URL='redis://localhost:16379/0'
 export GCU_TEST_S3_ENDPOINT='http://localhost:8333'
 export GCU_TEST_S3_ACCESS_KEY="$access"
 export GCU_TEST_S3_SECRET_KEY="$secret"
+export GCU_TEST_LOKI_URL='http://localhost:13100'
+export GCU_TEST_GRAFANA_URL='http://localhost:13000'
+export GCU_TEST_TEMPO_OTLP_URL='http://localhost:14318'
+export GCU_TEST_PROMETHEUS_URL='http://localhost:19090'
+export GCU_TEST_GRAFANA_PASSWORD="$GCU_GRAFANA_PASSWORD"
 
 echo "== integration tests"
 # The redis tests start their own disposable servers: redis:8 containers for most,
