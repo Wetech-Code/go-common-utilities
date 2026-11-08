@@ -8,22 +8,50 @@ import (
 // RedactAttr hides the value of an attribute whose key looks sensitive. It has
 // the signature of slog.HandlerOptions.ReplaceAttr, so handlers that format
 // records themselves (such as the Loki handler) can use it directly.
-func RedactAttr(_ []string, a slog.Attr) slog.Attr { return redact(nil, a) }
+func RedactAttr(groups []string, a slog.Attr) slog.Attr { return redact(groups, a) }
 
 // Redact returns a handler that hides sensitive attribute values (the same rule
 // New applies to its own output) before passing each record to h. Use it around
 // any handler that ships records somewhere else, so secrets never leave the
 // process. Attributes inside groups are checked too, and so are group names.
-func Redact(h slog.Handler) slog.Handler { return redactHandler{h} }
+func Redact(h slog.Handler) slog.Handler { return redactHandler{h: h} }
 
-type redactHandler struct{ h slog.Handler }
+// redactHandler hides sensitive values. hidden is true once WithGroup has opened
+// a group with a sensitive name: everything added under it is then hidden.
+type redactHandler struct {
+	h      slog.Handler
+	hidden bool
+}
+
+// clean returns a with sensitive values hidden; if the handler is inside a
+// sensitive group every value is hidden.
+func (r redactHandler) clean(a slog.Attr) slog.Attr {
+	if r.hidden {
+		return hideAll(a)
+	}
+	return redactDeep(a)
+}
+
+// hideAll keeps the keys and group structure of a but hides every value.
+func hideAll(a slog.Attr) slog.Attr {
+	a.Value = a.Value.Resolve()
+	if a.Value.Kind() == slog.KindGroup {
+		members := a.Value.Group()
+		hidden := make([]slog.Attr, len(members))
+		for i, m := range members {
+			hidden[i] = hideAll(m)
+		}
+		return slog.Attr{Key: a.Key, Value: slog.GroupValue(hidden...)}
+	}
+	return slog.String(a.Key, redacted)
+}
 
 func (r redactHandler) Enabled(ctx context.Context, l slog.Level) bool { return r.h.Enabled(ctx, l) }
 
 func (r redactHandler) Handle(ctx context.Context, rec slog.Record) error {
 	out := slog.NewRecord(rec.Time, rec.Level, rec.Message, rec.PC)
 	rec.Attrs(func(a slog.Attr) bool {
-		out.AddAttrs(redactDeep(a))
+		out.AddAttrs(r.clean(a))
 		return true
 	})
 	return r.h.Handle(ctx, out)
@@ -32,12 +60,14 @@ func (r redactHandler) Handle(ctx context.Context, rec slog.Record) error {
 func (r redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	clean := make([]slog.Attr, len(attrs))
 	for i, a := range attrs {
-		clean[i] = redactDeep(a)
+		clean[i] = r.clean(a)
 	}
-	return redactHandler{r.h.WithAttrs(clean)}
+	return redactHandler{r.h.WithAttrs(clean), r.hidden}
 }
 
-func (r redactHandler) WithGroup(name string) slog.Handler { return redactHandler{r.h.WithGroup(name)} }
+func (r redactHandler) WithGroup(name string) slog.Handler {
+	return redactHandler{r.h.WithGroup(name), r.hidden || isSensitive(name)}
+}
 
 // redactDeep applies the key rule to a and to everything inside groups.
 func redactDeep(a slog.Attr) slog.Attr {

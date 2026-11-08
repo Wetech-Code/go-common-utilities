@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -125,8 +126,10 @@ func isSensitive(key string) bool {
 	return false
 }
 
-func redact(_ []string, a slog.Attr) slog.Attr {
-	if isSensitive(a.Key) {
+// redact hides a leaf attribute whose key is sensitive, or that sits inside a
+// group (from WithGroup or slog.Group) whose name is sensitive.
+func redact(groups []string, a slog.Attr) slog.Attr {
+	if isSensitive(a.Key) || slices.ContainsFunc(groups, isSensitive) {
 		return slog.String(a.Key, redacted)
 	}
 	return a
