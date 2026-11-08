@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/event"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -48,6 +49,10 @@ type Config struct {
 	// ConnectTimeout bounds each new connection, server selection and the
 	// startup ping. Default DefaultConnectTimeout.
 	ConnectTimeout time.Duration
+	// Monitor, if set, is told about every command sent to the server. Use
+	// otelmongo.New from the telemetry/otelmongo package for OpenTelemetry spans
+	// and metrics, or any monitor of your own.
+	Monitor *event.CommandMonitor
 }
 
 // Validate reports problems with the configuration without connecting.
@@ -84,6 +89,9 @@ func New(ctx context.Context, cfg Config) (*mongo.Client, error) {
 	}
 	if cfg.MaxPoolSize > 0 {
 		opts.SetMaxPoolSize(cfg.MaxPoolSize)
+	}
+	if cfg.Monitor != nil {
+		opts.SetMonitor(cfg.Monitor)
 	}
 
 	client, err := mongo.Connect(opts)

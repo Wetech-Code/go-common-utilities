@@ -9,7 +9,11 @@ Module: `github.com/Wetech-Code/go-common-utilities` · Go 1.26.10 or newer
 | Package | What it gives you | Native type you get back |
 | --- | --- | --- |
 | [`config`](config) | Read env vars as string/int/bool/duration/list, collect all errors, require values | — |
-| [`logger`](logger) | `*slog.Logger` from a small config; JSON or text; redacts password/token/secret keys | `*slog.Logger` |
+| [`logger`](logger) | `*slog.Logger` from a small config; JSON or text; redacts password/token/secret keys; fans out to extra sinks | `*slog.Logger` |
+| [`logger/loki`](logger/loki) | Handler that pushes logs to Grafana Loki (stdlib only) | `slog.Handler` |
+| [`telemetry`](telemetry) | One setup for logs, traces and metrics over OTLP (Grafana Loki/Tempo/Prometheus, Grafana Cloud, Collector, ...); HTTP server and client instrumentation | `trace.Tracer`, `metric.Meter`, `slog.Handler` |
+| [`telemetry/otelpgx`](telemetry/otelpgx), [`otelmongo`](telemetry/otelmongo), [`otelredis`](telemetry/otelredis), [`otels3`](telemetry/otels3) | Spans and duration metrics for the Postgres, MongoDB, Redis and S3 clients | hook values for each `Config` |
+| [`logger/otlp`](logger/otlp) | Handler that exports logs with OpenTelemetry OTLP: Grafana Cloud, Loki, Collector, Datadog, Elastic, ... | `slog.Handler` |
 | [`postgres`](postgres) | Validated pgx pool, startup ping | `*pgxpool.Pool` |
 | [`mongodb`](mongodb) | Validated MongoDB client (driver v2), startup ping | `*mongo.Client` |
 | [`redis`](redis) | Validated go-redis client, startup ping | `*redis.Client` |
@@ -32,6 +36,9 @@ API documentation: https://pkg.go.dev/github.com/Wetech-Code/go-common-utilities
 import (
 	"github.com/Wetech-Code/go-common-utilities/config"
 	"github.com/Wetech-Code/go-common-utilities/logger"
+	"github.com/Wetech-Code/go-common-utilities/logger/loki" // optional: Grafana Loki
+	"github.com/Wetech-Code/go-common-utilities/logger/otlp" // optional: OpenTelemetry logs (adds the OTel SDK to your build)
+	"github.com/Wetech-Code/go-common-utilities/telemetry"   // optional: logs + traces + metrics, and telemetry/otelpgx etc.
 	"github.com/Wetech-Code/go-common-utilities/postgres"
 	"github.com/Wetech-Code/go-common-utilities/mongodb"
 	"github.com/Wetech-Code/go-common-utilities/redis"
@@ -39,7 +46,8 @@ import (
 )
 ```
 
-Importing `postgres` does not pull in the MongoDB, Redis or AWS libraries, and vice versa.
+Importing `postgres` does not pull in the MongoDB, Redis or AWS libraries, and vice versa. Likewise `logger` and
+`logger/loki` use only the standard library; only a program that imports `logger/otlp` or `telemetry` compiles the OpenTelemetry SDK.
 
 ## Configure, open, close
 
@@ -85,6 +93,104 @@ log.Info("connected")
 ```
 
 Each package has a runnable example in its `example_test.go` and full documentation via `go doc`, e.g. `go doc -all ./s3`.
+
+### Logger: console, Grafana Loki, OpenTelemetry
+
+`logger.New` returns a plain `*slog.Logger` writing JSON (or text) to the console. To also ship records elsewhere, build
+a handler from `logger/loki` or `logger/otlp` and pass it in `Config.Extra`. Any `slog.Handler` works there, so the same
+mechanism covers other sinks. `Config.Level` and the secret redaction (`password`, `token`, `api_key`, `dsn`, ... even
+inside groups) apply to every destination before a record leaves the process.
+
+```go
+lokiH, err := loki.New(loki.Config{
+	URL:    "http://loki.internal:3100",                      // or https://logs-prod-xx.grafana.net
+	Labels: map[string]string{"service": "api", "env": "prod"}, // keep labels few and stable
+	// Username/Password (Grafana Cloud), BearerToken or TenantID for secured Loki
+	ContextAttrs: otlp.TraceAttrs,                            // optional: trace_id / span_id in each line
+})
+otelH, err := otlp.New(ctx, otlp.Config{
+	Endpoint:    "http://collector.internal:4318",          // base URL; /v1/logs is added
+	Headers:     map[string]string{"Authorization": authHeader},
+	ServiceName: "api", ServiceVersion: "1.4.2", Environment: "prod",
+})
+log, err := logger.New(logger.Config{
+	Level:        "info",
+	Extra:        []slog.Handler{lokiH, otelH},              // console + Loki + OTLP
+	ContextAttrs: otlp.TraceAttrs,                           // console lines get trace_id / span_id
+})
+defer func() { // on shutdown, after the last log call
+	lokiH.Close(ctx)
+	otelH.Shutdown(ctx)
+}()
+
+log.InfoContext(ctx, "order placed", "order", 42, "password", "hunter2") // password is [REDACTED] everywhere
+```
+
+| | `logger/loki` | `logger/otlp` |
+| --- | --- | --- |
+| Protocol | Loki push API (JSON, gzip) | OTLP/HTTP (protobuf), official OpenTelemetry Go SDK |
+| Reaches | Grafana Loki, Grafana Cloud Logs | Grafana Cloud/Alloy, Loki's `/otlp` endpoint, OpenTelemetry Collector, Datadog, Elastic, Honeycomb, Splunk, ... |
+| Fields | one JSON line per record; labels = `Config.Labels` + `level` | body = message, attributes = fields, resource = `service.name` etc. |
+| Trace link | add `ContextAttrs: otlp.TraceAttrs` | automatic from the context's span |
+| Dependencies | standard library | OpenTelemetry SDK, protobuf, gRPC (compiled only if imported) |
+| Flush on exit | `Close(ctx)` | `Shutdown(ctx)` (`ForceFlush(ctx)` any time) |
+
+Grafana only displays logs; point its Loki data source at the Loki you push to, or use Grafana Cloud's OTLP gateway.
+Both handlers batch and send in the background, so logging never waits for the network. The Loki handler retries
+network errors, 429 and 5xx a few times, then drops the batch and calls `OnError` (default: standard error); when its
+queue is full it drops new records and counts them (`Dropped()`). Delivery is best effort: use the console output (collected
+by Alloy, Promtail or your platform) when you must not lose a line. For traces and metrics too, use `telemetry` below.
+
+### Telemetry: logs, traces and metrics
+
+`telemetry.New` starts all three OpenTelemetry signals with one service identity (`service.name`, version, environment),
+exports them over OTLP/HTTP, and hands you the pieces. Nothing is global unless you set `SetGlobal`, and instrumented code
+never waits on the network (everything is batched in the background; delivery is best effort).
+
+```go
+tel, err := telemetry.New(ctx, telemetry.Config{
+	Endpoint:       "http://collector.internal:4318",   // /v1/logs, /v1/traces, /v1/metrics are added
+	Headers:        map[string]string{"Authorization": authHeader},
+	ServiceName:    "api", ServiceVersion: "1.4.2", Environment: "prod",
+	RuntimeMetrics: true,                               // Go memory, goroutines, GC
+	SampleRatio:    0.1,                                // keep 10% of new traces (whole traces, never half)
+})
+defer tel.Shutdown(ctx)                                 // after the last log, span and measurement
+
+log, _ := logger.New(logger.Config{Extra: []slog.Handler{tel.LogHandler()}, ContextAttrs: telemetry.TraceAttrs})
+
+ctx, span := tel.Tracer("orders").Start(ctx, "place order")  // traces
+defer span.End()
+log.InfoContext(ctx, "order placed")                         // logs, linked to the span
+orders, _ := tel.Meter("orders").Int64Counter("orders.placed")
+orders.Add(ctx, 1)                                           // metrics
+
+srv := &http.Server{Handler: tel.HTTPHandler(mux, "api")}   // a span and http.server.* metrics per request
+client := &http.Client{Transport: tel.HTTPTransport(nil)}   // client spans, http.client.* metrics, trace headers forwarded
+```
+
+Where each signal goes: set `Endpoint` for one receiver (a Collector, Alloy, Grafana Cloud's OTLP gateway), or
+`LogsEndpoint`, `TracesEndpoint` and `MetricsEndpoint` for separate backends: Loki's `.../otlp`, Tempo's OTLP port, and
+Prometheus's `.../api/v1/otlp` (start it with `--web.enable-otlp-receiver`). Leave everything empty to use the standard
+`OTEL_EXPORTER_OTLP_*` environment variables. `DisableLogs`, `DisableTraces` and `DisableMetrics` turn a signal off;
+its accessors then return working no-ops. A trace continues from the incoming `traceparent` header, and an unsampled or
+sampled decision from the caller is respected.
+
+Instrument the clients by passing the providers in each package's `Config`; spans never contain statements, keys, bucket
+names, command arguments or error messages, only operation names and error types or codes (such as the SQLSTATE):
+
+```go
+pool, _ := postgres.New(ctx, postgres.Config{URL: dsn, Tracer: otelpgx.New(tel.TracerProvider(), tel.MeterProvider())})
+mdb, _  := mongodb.New(ctx, mongodb.Config{URI: uri, Monitor: otelmongo.New(tel.TracerProvider(), tel.MeterProvider())})
+rdb, _  := redis.New(ctx, redis.Config{URL: url, Hooks: []goredis.Hook{otelredis.New(tel.TracerProvider(), tel.MeterProvider())}})
+st, _   := s3.New(ctx, s3.Config{ /* ... */ APIOptions: otels3.APIOptions(tel.TracerProvider(), tel.MeterProvider())})
+```
+
+Each records one client span per operation (Postgres: query, batch, COPY, prepare, connect; MongoDB: every command except the
+handshake; Redis: commands and pipelines; S3: every operation) and the `db.client.operation.duration` histogram, so database
+latency appears in Tempo next to the request that caused it and in Prometheus as a metric. `otelpgx.WithStatement()` adds the
+SQL text if your statements never contain data. The `telemetry` packages are separate imports, so a program that does not
+import them does not compile the OpenTelemetry SDK or HTTP instrumentation.
 
 ### PostgreSQL
 
@@ -321,7 +427,7 @@ Tests run on your machine; the GitHub workflow only publishes releases and runs 
 
 ```sh
 scripts/check.sh          # gofmt, go mod tidy/verify, go vet, go test -race, consumer build, govulncheck
-scripts/integration.sh    # Docker: real PostgreSQL, MongoDB, Redis and SeaweedFS, then the consumer check
+scripts/integration.sh    # Docker: real PostgreSQL, MongoDB, Redis, SeaweedFS, Loki, Tempo, Prometheus and Grafana, then the consumer check
 ```
 
 `scripts/check.sh` needs only Go. `scripts/integration.sh` needs Docker with the compose plugin. It creates random
@@ -338,6 +444,7 @@ with `-v`) when its variable is unset. You can point them at servers you already
 | postgres | `GCU_TEST_POSTGRES_URL` |
 | mongodb | `GCU_TEST_MONGODB_URI` |
 | redis | `GCU_TEST_REDIS_URL` |
+| logger, telemetry | `GCU_TEST_LOKI_URL`, `GCU_TEST_GRAFANA_URL`, `GCU_TEST_GRAFANA_PASSWORD`, and for telemetry also `GCU_TEST_TEMPO_OTLP_URL`, `GCU_TEST_PROMETHEUS_URL` (Loki, Tempo, Prometheus and Grafana; everything is read back through Grafana's data sources) |
 | s3 | `GCU_TEST_S3_ENDPOINT`, `GCU_TEST_S3_ACCESS_KEY`, `GCU_TEST_S3_SECRET_KEY`, optional `GCU_TEST_S3_BUCKET` (default `gcu-test`, created if missing; the client tests create and delete their own uniquely named buckets) |
 
 ```sh
@@ -378,16 +485,18 @@ Chosen and verified on 2026-11-07.
 | `go.mongodb.org/mongo-driver/v2` | v2.10.0 |
 | `github.com/redis/go-redis/v9` | v9.23.0 |
 | `github.com/aws/aws-sdk-go-v2` / `service/s3` / `credentials` | v1.47.8 / v1.114.9 / v1.20.16 |
-| SeaweedFS (integration tested) | 4.52 |
+| `go.opentelemetry.io/otel` / `sdk/log` / `otlploghttp` / `otelslog` | v1.47.0 / v1.47.0 / v0.23.0 / v0.21.0 |
+| `otelhttp` / OTel runtime metrics (contrib) | v0.72.0 / v0.72.0 |
+| SeaweedFS / Loki / Grafana / Tempo / Prometheus (integration tested) | 4.52 / 3.7.9 / 12.4.14 / 2.9.5 / 3.9.1 |
 
 `go.mod` has a `toolchain go1.27.3` line, so inside this repo Go downloads and uses 1.27.3 automatically (consumers only
 need the 1.26.10 minimum). Use Go 1.27.3+ or 1.26.10+ for your own builds: 1.27.1 has standard-library advisories, and
 `govulncheck` run with it reports them even though the library code is fine.
 
-Integration tests were run on 2026-11-07 against PostgreSQL 16.14, MongoDB 8.3.4, Redis 8.8.0 and SeaweedFS 4.52
-(installed locally with Homebrew), and all passed. Compatibility is only claimed for what those tests
-ran; other server versions are untested. The SeaweedFS test covers single-object Put/Get/Delete, presigned GET/PUT and credential
-rejection. Multipart upload, listing and tagging are not covered.
+Integration tests were last run on 2026-11-08 in Docker against PostgreSQL 18, MongoDB 8.3.13, Redis 8.10.3,
+SeaweedFS 4.52, Loki 3.7.9, Tempo 2.9.5, Prometheus 3.9.1 and Grafana 12.4.14, and all passed. Compatibility is only claimed for what those tests ran;
+other server versions are untested. See the S3 section for exactly which operations SeaweedFS accepts. The OTLP handler
+is tested against Loki's own OTLP endpoint and a fake receiver, not against Datadog, Elastic, Honeycomb or Splunk.
 
 ## Releases and upgrades
 

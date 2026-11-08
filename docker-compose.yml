@@ -43,3 +43,45 @@ services:
     ports:
       - "127.0.0.1:8333:8333"
       - "127.0.0.1:9333:9333"
+
+  loki:
+    image: grafana/loki:3.7.9
+    command: -config.file=/etc/loki/local-config.yaml
+    ports: ["127.0.0.1:13100:3100"]
+    # The image has no shell, so there is no container healthcheck;
+    # scripts/integration.sh waits for http://localhost:13100/ready instead.
+
+  grafana:
+    image: grafana/grafana:12.4.14
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Random for every run; scripts/integration.sh sets it.
+      GF_SECURITY_ADMIN_PASSWORD: ${GCU_GRAFANA_PASSWORD:?run scripts/integration.sh, which sets this}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    depends_on: [loki, tempo, prometheus]
+    ports: ["127.0.0.1:13000:3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000/api/health | grep -q ok"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  tempo:
+    image: grafana/tempo:2.9.5
+    command: -config.file=/etc/tempo.yaml
+    volumes:
+      - ./docker/tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "127.0.0.1:14318:4318"   # OTLP/HTTP in
+      - "127.0.0.1:13200:3200"   # query API
+    # No shell in the image, so no container healthcheck; scripts/integration.sh
+    # waits for http://localhost:13200/ready.
+
+  prometheus:
+    image: prom/prometheus:v3.9.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-otlp-receiver
+      - --storage.tsdb.path=/prometheus
+    ports: ["127.0.0.1:19090:9090"]
