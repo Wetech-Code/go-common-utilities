@@ -16,8 +16,11 @@
 //
 // The set is fetched on first use and cached. When a token names a key the cache
 // does not have (the provider rotated its keys) the set is fetched again, but at
-// most once per MinRefreshInterval so a flood of forged key IDs cannot make the
-// service hammer the provider. If a refresh fails, the previous keys keep working.
+// most once per MinRefreshInterval, whether or not any keys are cached, so a flood
+// of forged key IDs (or a provider that is down) cannot make the service hammer
+// the provider. A fetch runs independently of the request that triggered it, so a
+// client that disconnects does not abort it, and requests that arrive meanwhile
+// share it. If a refresh fails, the previous keys keep working.
 //
 // Safety rules: the URL must be https (plain http is accepted only for loopback
 // addresses, for tests), certificates are always verified, redirects are refused,
@@ -81,8 +84,9 @@ type Config struct {
 	// HTTPClient sends the requests. Default: a client with the standard
 	// certificate checks. Redirects are refused whichever client is used.
 	HTTPClient *http.Client
-	// OnError is told about failed refreshes, which are otherwise silent because
-	// the previous keys keep working. Default: ignore.
+	// OnError is told about each failed fetch, which are otherwise silent because
+	// the previous keys keep working. It is called from the goroutine that ran the
+	// fetch, once per failure. Default: ignore.
 	OnError func(error)
 	// Now returns the current time. Default time.Now; set it in tests.
 	Now func() time.Time
@@ -122,9 +126,17 @@ type Set struct {
 
 	mu        sync.RWMutex
 	keys      map[string]crypto.PublicKey
-	fetchedAt time.Time // time of the last fetch attempt
-	loadedAt  time.Time // time of the last successful fetch
-	refresh   sync.Mutex
+	fetchedAt time.Time // when the last fetch attempt started
+	loadedAt  time.Time // when the last successful fetch finished
+	lastErr   error     // result of the last fetch attempt (nil if it succeeded)
+	inflight  *fetchCall
+}
+
+// fetchCall is one fetch in progress; callers that arrive meanwhile wait for it
+// instead of starting another.
+type fetchCall struct {
+	done chan struct{}
+	err  error
 }
 
 // New validates cfg and returns a Set. It does not fetch; the first PublicKey
@@ -177,9 +189,6 @@ func (s *Set) PublicKey(ctx context.Context, kid string) (crypto.PublicKey, erro
 	}
 	if s.cfg.URL != "" {
 		if err := s.refreshIfAllowed(ctx, kid); err != nil {
-			if s.cfg.OnError != nil {
-				s.cfg.OnError(err)
-			}
 			if _, have := s.snapshot(); !have {
 				return nil, err // nothing cached to fall back on
 			}
@@ -220,45 +229,78 @@ func (s *Set) stale() bool {
 	return s.cfg.URL != "" && s.cfg.Now().Sub(s.loadedAt) >= s.cfg.CacheTTL
 }
 
-// refreshIfAllowed fetches unless a fetch was attempted less than
-// MinRefreshInterval ago. Concurrent callers share one fetch.
+// refreshIfAllowed makes sure a fetch has happened recently enough. It never
+// starts a fetch less than MinRefreshInterval after the previous attempt, whether
+// or not anything is cached: when it is too soon it returns the previous
+// attempt's outcome. Callers that arrive while a fetch is running share it.
 func (s *Set) refreshIfAllowed(ctx context.Context, kid string) error {
-	s.refresh.Lock()
-	defer s.refresh.Unlock()
-
-	s.mu.RLock()
-	last, haveKeys := s.fetchedAt, s.keys != nil
-	s.mu.RUnlock()
-	if haveKeys {
-		// Another caller may have just refreshed.
-		if _, ok := s.lookup(kid); ok && !s.stale() {
-			return nil
-		}
-		if s.cfg.Now().Sub(last) < s.cfg.MinRefreshInterval {
-			return nil // too soon; let the lookup report what is cached
-		}
+	if _, ok := s.lookup(kid); ok && !s.stale() {
+		return nil // another caller just refreshed
 	}
-	return s.fetch(ctx)
+	s.mu.Lock()
+	if c := s.inflight; c != nil {
+		s.mu.Unlock()
+		return s.wait(ctx, c)
+	}
+	if !s.fetchedAt.IsZero() && s.cfg.Now().Sub(s.fetchedAt) < s.cfg.MinRefreshInterval {
+		err := s.lastErr
+		s.mu.Unlock()
+		return err // too soon; let the caller see what is cached
+	}
+	c := s.startFetchLocked()
+	s.mu.Unlock()
+	return s.wait(ctx, c)
 }
 
-// Refresh fetches the key set now, ignoring MinRefreshInterval. Call it at
-// startup to fail early if the provider is unreachable. It does nothing for a Set
-// made with FromJSON.
+// Refresh fetches the key set now, ignoring MinRefreshInterval (but sharing a
+// fetch that is already running). Call it at startup to fail early if the
+// provider is unreachable. It does nothing for a Set made with FromJSON.
 func (s *Set) Refresh(ctx context.Context) error {
 	if s.cfg.URL == "" {
 		return nil
 	}
-	s.refresh.Lock()
-	defer s.refresh.Unlock()
-	return s.fetch(ctx)
+	s.mu.Lock()
+	c := s.inflight
+	if c == nil {
+		c = s.startFetchLocked()
+	}
+	s.mu.Unlock()
+	return s.wait(ctx, c)
 }
 
-func (s *Set) fetch(ctx context.Context) error {
-	s.mu.Lock()
+// startFetchLocked starts a fetch that does not depend on any caller's context:
+// a caller that gives up (a client that disconnects) must not abort the fetch
+// everyone else is waiting for, nor make the attempt count against the refresh
+// limit with nothing to show for it. The caller holds s.mu.
+func (s *Set) startFetchLocked() *fetchCall {
+	c := &fetchCall{done: make(chan struct{})}
+	s.inflight = c
 	s.fetchedAt = s.cfg.Now()
-	s.mu.Unlock()
+	go func() {
+		err := s.fetch()
+		if err != nil && s.cfg.OnError != nil {
+			s.cfg.OnError(err)
+		}
+		s.mu.Lock()
+		c.err, s.lastErr, s.inflight = err, err, nil
+		s.mu.Unlock()
+		close(c.done)
+	}()
+	return c
+}
 
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+// wait returns the fetch's result, or ctx's error if the caller gives up first.
+func (s *Set) wait(ctx context.Context, c *fetchCall) error {
+	select {
+	case <-c.done:
+		return c.err
+	case <-ctx.Done():
+		return fmt.Errorf("jwks: gave up waiting for the key set: %w", ctx.Err())
+	}
+}
+
+func (s *Set) fetch() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.URL, nil)
 	if err != nil {

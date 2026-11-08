@@ -538,3 +538,124 @@ func TestVerifyContextBoundsTheKeyFetch(t *testing.T) {
 }
 
 var _ crypto.PublicKey = (*rsa.PublicKey)(nil)
+
+func TestAProviderThatIsDownIsNotHammered(t *testing.T) {
+	srv := newServer(t, []byte("down"))
+	srv.set([]byte("down"), 503)
+	clk := &clock{t: time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)}
+	var failures atomic.Int64
+	set, _ := jwks.New(jwks.Config{URL: srv.URL, MinRefreshInterval: time.Minute, Now: clk.now,
+		OnError: func(error) { failures.Add(1) }})
+
+	// 50 concurrent verifications with nothing cached and the provider down.
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := set.PublicKey(context.Background(), fmt.Sprintf("forged-%d", i)); err == nil {
+				t.Error("want an error while the provider is down")
+			}
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < 50; i++ { // and 50 more, one at a time
+		set.PublicKey(context.Background(), "forged")
+	}
+	if got := srv.hits.Load(); got != 1 {
+		t.Errorf("a provider that is down was asked %d times within the refresh interval, want 1", got)
+	}
+	if failures.Load() != 1 {
+		t.Errorf("OnError called %d times for one failed fetch", failures.Load())
+	}
+	// The error is the real one, not a misleading "no key".
+	if _, err := set.PublicKey(context.Background(), "k"); err == nil || !strings.Contains(err.Error(), "status 503") {
+		t.Errorf("too-soon error = %v", err)
+	}
+
+	// Once the interval has passed it tries again, and recovers when the provider does.
+	srv.set(doc(rsaJWK("k", &rsa1.PublicKey)), 200)
+	clk.add(61 * time.Second)
+	if _, err := set.PublicKey(context.Background(), "k"); err != nil {
+		t.Errorf("recovery: %v", err)
+	}
+	if srv.hits.Load() != 2 {
+		t.Errorf("hits = %d, want 2", srv.hits.Load())
+	}
+}
+
+func TestACallerThatGivesUpDoesNotAbortOrBurnTheRefresh(t *testing.T) {
+	release := make(chan struct{})
+	var hits atomic.Int64
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		<-release
+		w.Write(doc(rsaJWK("k", &rsa1.PublicKey)))
+	}))
+	defer slow.Close()
+	clk := &clock{t: time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)} // never advances: the limit stays in force
+	set, _ := jwks.New(jwks.Config{URL: slow.URL, MinRefreshInterval: time.Hour, Now: clk.now})
+
+	// An attacker's request starts the fetch and disconnects at once.
+	gone, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := set.PublicKey(gone, "forged"); done <- err }()
+	deadline := time.Now().Add(2 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("the caller that gave up should see its own cancellation: %v", err)
+	}
+
+	// A legitimate caller arrives while the fetch is still running and shares it.
+	legit := make(chan error, 1)
+	go func() { _, err := set.PublicKey(context.Background(), "k"); legit <- err }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if err := <-legit; err != nil {
+		t.Errorf("a legitimate caller must still get the key: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("the fetch ran %d times", hits.Load())
+	}
+	// And the key is cached: no new fetch is needed or allowed.
+	if _, err := set.PublicKey(context.Background(), "k"); err != nil || hits.Load() != 1 {
+		t.Errorf("after the fetch: err=%v hits=%d", err, hits.Load())
+	}
+}
+
+func TestRefreshSharesAFetchInProgress(t *testing.T) {
+	release := make(chan struct{})
+	var hits atomic.Int64
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		<-release
+		w.Write(doc(rsaJWK("k", &rsa1.PublicKey)))
+	}))
+	defer slow.Close()
+	set, _ := jwks.New(jwks.Config{URL: slow.URL})
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := set.Refresh(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if hits.Load() != 1 {
+		t.Errorf("5 concurrent Refresh calls made %d requests", hits.Load())
+	}
+	// Refresh ignores the refresh interval when nothing is in flight.
+	release2 := make(chan struct{})
+	close(release2)
+	if err := set.Refresh(context.Background()); err != nil || hits.Load() != 2 {
+		t.Errorf("explicit Refresh: err=%v hits=%d", err, hits.Load())
+	}
+}
