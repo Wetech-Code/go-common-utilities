@@ -178,9 +178,10 @@ func TestSecretsAreHiddenInLines(t *testing.T) {
 	log := slog.New(h).With("api_key", "k-1")
 	log.Info("login", "password", "hunter2", slog.Group("credentials", slog.String("user", "u")), slog.Group("db", slog.String("dsn", "pg://x")))
 	slog.New(h).WithGroup("g").Info("x", "Token", "t-9")
+	slog.New(h).WithGroup("credentials").Info("y", "user", "user-7")
 	closeIt(t, h)
 	all := strings.Join(f.lines(), "\n")
-	for _, leaked := range []string{"hunter2", "k-1", `"user"`, "pg://x", "t-9"} {
+	for _, leaked := range []string{"hunter2", "k-1", `"user":"u"`, "pg://x", "t-9", "user-7"} {
 		if strings.Contains(all, leaked) {
 			t.Errorf("%q leaked: %s", leaked, all)
 		}

@@ -139,3 +139,40 @@ func TestNilExtraIsRejected(t *testing.T) {
 		t.Error("want error for a nil Extra handler")
 	}
 }
+
+func TestSensitiveGroupNamesHideEverythingUnderThem(t *testing.T) {
+	var console bytes.Buffer
+	extra := newCapture(slog.LevelDebug)
+	log, _ := logger.New(logger.Config{Output: &console, Extra: []slog.Handler{extra}})
+
+	// WithGroup with a sensitive name, attributes added at the record and by With.
+	log.WithGroup("credentials").Info("a", "user", "alice-1", slog.Group("inner", slog.String("note", "note-1")))
+	log.WithGroup("secrets").With("name", "bob-2").Info("b", "k", "v-2")
+	// Nested: the hiding carries into later groups and attributes.
+	log.WithGroup("auth_token").WithGroup("db").With("host", "host-3").Info("c", "port", 5432)
+	// A harmless group stays readable.
+	log.WithGroup("request").Info("d", "path", "/ok-4")
+
+	for name, out := range map[string]string{"console": console.String(), "extra": extra.String()} {
+		for _, leaked := range []string{"alice-1", "note-1", "bob-2", "v-2", "host-3", "5432"} {
+			if strings.Contains(out, leaked) {
+				t.Errorf("%s leaked %q: %s", name, leaked, out)
+			}
+		}
+		if !strings.Contains(out, "/ok-4") {
+			t.Errorf("%s hid a harmless group: %s", name, out)
+		}
+		if !strings.Contains(out, `"user":"[REDACTED]"`) && name == "extra" {
+			t.Errorf("keys should stay visible with hidden values: %s", out)
+		}
+	}
+}
+
+func TestRedactAttrChecksTheGroupPath(t *testing.T) {
+	if got := logger.RedactAttr([]string{"db", "credentials"}, slog.String("user", "x")); got.Value.String() != "[REDACTED]" {
+		t.Errorf("got %v", got)
+	}
+	if got := logger.RedactAttr([]string{"db"}, slog.String("user", "x")); got.Value.String() != "x" {
+		t.Errorf("got %v", got)
+	}
+}
