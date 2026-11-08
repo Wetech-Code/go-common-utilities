@@ -173,7 +173,8 @@ and keep the private key with the issuer. `jwt.ParsePrivateKeyPEM` reads PKCS#8,
 | | |
 | --- | --- |
 | Algorithms | HS256 HS384 HS512, RS256 RS384 RS512, PS256 PS384 PS512, ES256 ES384 ES512, EdDSA |
-| Functions | `New` `Sign` `SignWithTTL` `Verify` `Inspect` `ParsePrivateKeyPEM` `ParsePublicKeyPEM` |
+| Functions | `New` `Sign` `SignWithTTL` `Verify` `VerifyContext` `Inspect` `ParsePrivateKeyPEM` `ParsePublicKeyPEM` |
+| Provider keys | `jwt/jwks`: `New` (fetch and cache an identity provider's key set), `FromJSON`, `Parse`, `Refresh` |
 | Errors | `ErrExpired` `ErrNotYetValid` `ErrInvalid` `ErrNoSigningKey` `ErrConfig` |
 
 What it enforces: the algorithm comes from your `Config`, never from the token, so `alg: none` and algorithm-confusion
@@ -183,8 +184,22 @@ as long as the hash output, RSA keys at least 2048 bits, and ECDSA keys must mat
 canonical; tokens over `MaxTokenSize` (8 KiB) are refused before parsing; errors name a category but never contain the token,
 keys or claim values. `Inspect` decodes a token **without** checking it (to read a `kid` or for debugging) and is marked
 dangerous: never authorize anything from it.
-Not included: fetching remote key sets (JWKS), encrypted tokens (JWE), refresh-token storage or revocation lists, and
-login or session handling. Whether a token's holder may do something is the caller's decision.
+Not included: encrypted tokens (JWE), refresh-token storage or revocation lists, and login or session handling. Whether a token's holder may do something is the caller's decision.
+
+To verify tokens issued by an identity provider (Auth0, Keycloak, Cognito, Google, ...), point `jwt/jwks` at its key set and
+use it as the `KeySource`. Keys are fetched on first use, cached, and fetched again when a token names a key you do not have
+(the provider rotated), at most once per `MinRefreshInterval`, so forged key IDs cannot make you hammer the provider; if a
+refresh fails the old keys keep working. The URL must be https (plain http only for localhost), certificates are always
+verified, redirects and oversized responses are refused, only public RSA, EC and Ed25519 keys are read, and a key set that
+contains private key material or a shared secret is rejected. The algorithm you configure still decides what is accepted, and
+every key the provider publishes is checked against it (type, RSA size, curve).
+
+```go
+set, err := jwks.New(jwks.Config{URL: "https://idp.example.com/.well-known/jwks.json"})
+if err := set.Refresh(ctx); err != nil { return err } // optional: fail at startup if the provider is unreachable
+c, err := jwt.New(jwt.Config{Algorithm: "RS256", KeySource: set, Issuer: "https://idp.example.com/", Audience: []string{"my-api"}})
+claims, err := c.VerifyContext(ctx, bearerToken)       // the context bounds the key fetch
+```
 
 ### Logger: console, Grafana Loki, OpenTelemetry
 
