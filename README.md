@@ -9,6 +9,7 @@ Module: `github.com/Wetech-Code/go-common-utilities` · Go 1.26.10 or newer
 | Package | What it gives you | Native type you get back |
 | --- | --- | --- |
 | [`config`](config) | Read env vars (and `.env` files, Docker/Kubernetes secret files) as typed values, load a whole struct from tags, collect every error at once | — |
+| [`jwt`](jwt) | Sign and verify JSON Web Tokens (HS/RS/PS/ES/EdDSA) with safe defaults: fixed algorithm, required expiry, key checks, rotation | token strings, `jwt.Claims` |
 | [`logger`](logger) | `*slog.Logger` from a small config; JSON or text; redacts password/token/secret keys; fans out to extra sinks | `*slog.Logger` |
 | [`logger/loki`](logger/loki) | Handler that pushes logs to Grafana Loki (stdlib only) | `slog.Handler` |
 | [`telemetry`](telemetry) | One setup for logs, traces and metrics over OTLP (Grafana Loki/Tempo/Prometheus, Grafana Cloud, Collector, ...); HTTP server and client instrumentation | `trace.Tracer`, `metric.Meter`, `slog.Handler` |
@@ -35,6 +36,7 @@ API documentation: https://pkg.go.dev/github.com/Wetech-Code/go-common-utilities
 ```go
 import (
 	"github.com/Wetech-Code/go-common-utilities/config"
+	"github.com/Wetech-Code/go-common-utilities/jwt"
 	"github.com/Wetech-Code/go-common-utilities/logger"
 	"github.com/Wetech-Code/go-common-utilities/logger/loki" // optional: Grafana Loki
 	"github.com/Wetech-Code/go-common-utilities/logger/otlp" // optional: OpenTelemetry logs (adds the OTel SDK to your build)
@@ -144,6 +146,45 @@ nested structs. `WithFileSecrets` makes an unset `KEY` fall back to the file nam
 development: `KEY=VALUE` lines, `#` comments, `export`, single quotes (literal) and double quotes (`\n`, `\t`, `\"`, `\\`
 escapes), no variable expansion; real environment variables always override the file, and nothing reads a file unless you call it.
 Not included, on purpose: JSON, YAML or TOML files, hot reload, and remote configuration servers.
+
+### JWT
+
+`jwt` signs and verifies JSON Web Tokens on top of [`golang-jwt/jwt/v5`](https://github.com/golang-jwt/jwt); it adds
+safe defaults instead of its own cryptography. A token is signed, not encrypted: anyone can read its claims, so do not put
+secrets in them.
+
+```go
+c, err := jwt.New(jwt.Config{
+	Algorithm: "HS256",                       // required; only this algorithm is ever accepted
+	Key:       jwt.Key{ID: "2026-11", Secret: secret}, // at least 32 random bytes for HS256
+	OldKeys:   []jwt.Key{{ID: "2026-05", Secret: oldSecret}}, // still verify during a rotation
+	Issuer:    "api.example.com",
+	Audience:  []string{"web"},
+	TTL:       15 * time.Minute,
+	Leeway:    30 * time.Second,              // clock skew between services
+})
+token, err := c.Sign(jwt.Claims{Subject: "user-42", Extra: map[string]any{"role": "admin"}})
+claims, err := c.Verify(token)               // errors.Is(err, jwt.ErrExpired / jwt.ErrNotYetValid / jwt.ErrInvalid)
+```
+
+For a service that only checks tokens, give it the public key (`jwt.Key{Public: pub}`, read with `jwt.ParsePublicKeyPEM`)
+and keep the private key with the issuer. `jwt.ParsePrivateKeyPEM` reads PKCS#8, PKCS#1 and SEC 1 keys.
+
+| | |
+| --- | --- |
+| Algorithms | HS256 HS384 HS512, RS256 RS384 RS512, PS256 PS384 PS512, ES256 ES384 ES512, EdDSA |
+| Functions | `New` `Sign` `SignWithTTL` `Verify` `Inspect` `ParsePrivateKeyPEM` `ParsePublicKeyPEM` |
+| Errors | `ErrExpired` `ErrNotYetValid` `ErrInvalid` `ErrNoSigningKey` `ErrConfig` |
+
+What it enforces: the algorithm comes from your `Config`, never from the token, so `alg: none` and algorithm-confusion
+tokens (such as an HS256 token signed with an RSA public key) are rejected; tokens must have an `exp`, and `Sign` always sets
+one; issuer and audience are checked when configured; tokens issued in the future are refused; HMAC secrets must be at least
+as long as the hash output, RSA keys at least 2048 bits, and ECDSA keys must match their curve; base64 padding bits must be
+canonical; tokens over `MaxTokenSize` (8 KiB) are refused before parsing; errors name a category but never contain the token,
+keys or claim values. `Inspect` decodes a token **without** checking it (to read a `kid` or for debugging) and is marked
+dangerous: never authorize anything from it.
+Not included: fetching remote key sets (JWKS), encrypted tokens (JWE), refresh-token storage or revocation lists, and
+login or session handling. Whether a token's holder may do something is the caller's decision.
 
 ### Logger: console, Grafana Loki, OpenTelemetry
 
@@ -535,6 +576,7 @@ Chosen and verified on 2026-11-07.
 | `github.com/jackc/pgx/v5` | v5.12.0 |
 | `go.mongodb.org/mongo-driver/v2` | v2.10.0 |
 | `github.com/redis/go-redis/v9` | v9.23.0 |
+| `github.com/golang-jwt/jwt/v5` | v5.3.1 |
 | `github.com/aws/aws-sdk-go-v2` / `service/s3` / `credentials` | v1.47.8 / v1.114.9 / v1.20.16 |
 | `go.opentelemetry.io/otel` / `sdk/log` / `otlploghttp` / `otelslog` | v1.47.0 / v1.47.0 / v0.23.0 / v0.21.0 |
 | `otelhttp` / OTel runtime metrics (contrib) | v0.72.0 / v0.72.0 |

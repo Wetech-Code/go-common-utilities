@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/Wetech-Code/go-common-utilities/config"
+	"github.com/Wetech-Code/go-common-utilities/jwt"
 	"github.com/Wetech-Code/go-common-utilities/logger"
 	"github.com/Wetech-Code/go-common-utilities/logger/loki"
 	"github.com/Wetech-Code/go-common-utilities/logger/otlp"
@@ -175,6 +176,19 @@ func run() error {
 	stop, cancelStop := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelStop()
 	_ = tel.Shutdown(stop) // the receiver is unreachable on purpose; only the call returning matters
+
+	// Tokens need no server either.
+	jc, err := jwt.New(jwt.Config{Algorithm: "HS256", Key: jwt.Key{Secret: []byte(strings.Repeat("k", 32))}, TTL: time.Minute})
+	if err != nil {
+		return err
+	}
+	tok, err := jc.Sign(jwt.Claims{Subject: "consumer"})
+	if err != nil {
+		return err
+	}
+	if _, err := jc.Verify(tok); err != nil {
+		return err
+	}
 
 	// Config types must stay usable without any server.
 	for name, err := range map[string]error{
