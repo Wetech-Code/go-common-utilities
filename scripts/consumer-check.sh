@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -37,6 +38,10 @@ import (
 	"github.com/Wetech-Code/go-common-utilities/config"
 	"github.com/Wetech-Code/go-common-utilities/jwt"
 	"github.com/Wetech-Code/go-common-utilities/logger"
+	"github.com/Wetech-Code/go-common-utilities/middleware"
+	"github.com/Wetech-Code/go-common-utilities/httpclient"
+	"github.com/Wetech-Code/go-common-utilities/reqctx"
+	"github.com/Wetech-Code/go-common-utilities/server"
 	"github.com/Wetech-Code/go-common-utilities/logger/loki"
 	"github.com/Wetech-Code/go-common-utilities/logger/otlp"
 	"github.com/Wetech-Code/go-common-utilities/mongodb"
@@ -48,6 +53,7 @@ import (
 	"github.com/Wetech-Code/go-common-utilities/telemetry/otelpgx"
 	"github.com/Wetech-Code/go-common-utilities/telemetry/otelredis"
 	"github.com/Wetech-Code/go-common-utilities/telemetry/otels3"
+	"github.com/Wetech-Code/go-common-utilities/validator"
 )
 
 func main() {
@@ -176,6 +182,46 @@ func run() error {
 	stop, cancelStop := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelStop()
 	_ = tel.Shutdown(stop) // the receiver is unreachable on purpose; only the call returning matters
+
+	// So does request validation.
+	type checkReq struct {
+		ID string `query:"id" validate:"required,identifier"`
+	}
+	var cr checkReq
+	hr, err := http.NewRequest(http.MethodGet, "http://example.test/?id=abc-1", nil)
+	if err != nil {
+		return err
+	}
+	if err := validator.Bind(hr, &cr); err != nil || cr.ID != "abc-1" {
+		return fmt.Errorf("validator: %+v %v", cr, err)
+	}
+
+	// A service starts, answers one request and shuts down cleanly.
+	srv, err := server.New(server.Config{Addr: "127.0.0.1:0", Logger: log,
+		Handler: middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, reqctx.RequestID(r.Context())) }), middleware.RequestID())})
+	if err != nil {
+		return err
+	}
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- srv.Run(runCtx) }()
+	select {
+	case <-srv.Ready():
+	case err := <-runDone:
+		return err
+	}
+	hc, err := httpclient.New(httpclient.Config{BaseURL: "http://" + srv.Addr().String(), PathPrefix: "/p"})
+	if err != nil {
+		return err
+	}
+	if resp, err := hc.Do(ctx, http.MethodGet, "ping"); err != nil || resp.Status != http.StatusOK || string(resp.Body) != resp.Header.Get("X-Request-Id") {
+		return fmt.Errorf("httpclient: %+v %v", resp, err)
+	}
+	stopRun()
+	if err := <-runDone; err != nil {
+		return err
+	}
 
 	// Tokens need no server either.
 	jc, err := jwt.New(jwt.Config{Algorithm: "HS256", Key: jwt.Key{Secret: []byte(strings.Repeat("k", 32))}, TTL: time.Minute})

@@ -86,6 +86,24 @@ func redactDeep(a slog.Attr) slog.Attr {
 	return redact(nil, a)
 }
 
+// JoinContextAttrs combines several context-attribute functions into one, for
+// logger.Config.ContextAttrs:
+//
+//	logger.Config{ContextAttrs: logger.JoinContextAttrs(telemetry.TraceAttrs, reqctx.Attrs)}
+//
+// Nil functions are skipped.
+func JoinContextAttrs(fns ...func(context.Context) []slog.Attr) func(context.Context) []slog.Attr {
+	return func(ctx context.Context) []slog.Attr {
+		var out []slog.Attr
+		for _, fn := range fns {
+			if fn != nil {
+				out = append(out, fn(ctx)...)
+			}
+		}
+		return out
+	}
+}
+
 // WithContextAttrs returns a handler that adds the attributes fn returns for the
 // record's context to every record, for example trace and span IDs. fn may
 // return nil.
