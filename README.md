@@ -9,6 +9,8 @@ Module: `github.com/Wetech-Code/go-common-utilities` · Go 1.26.10 or newer
 | Package | What it gives you | Native type you get back |
 | --- | --- | --- |
 | [`config`](config) | Read env vars (and `.env` files, Docker/Kubernetes secret files) as typed values, load a whole struct from tags, collect every error at once | — |
+| [`reqctx`](reqctx), [`middleware`](middleware), [`server`](server), [`httpclient`](httpclient) | Service building blocks: request IDs and trusted-header context, request ID / header capture / recover / access-log / limits middleware, an HTTP server with graceful shutdown and TLS or mutual TLS, a safe client for calling other services | `http.Handler` middleware, `*server.Server` |
+| [`validator`](validator) | Bind an HTTP request's JSON body, query, path values and headers into a typed struct in one call, with strict parsing, explicit normalization and validation rules, and client-safe errors | typed request structs |
 | [`jwt`](jwt) | Sign and verify JSON Web Tokens (HS/RS/PS/ES/EdDSA) with safe defaults: fixed algorithm, required expiry, key checks, rotation | token strings, `jwt.Claims` |
 | [`logger`](logger) | `*slog.Logger` from a small config; JSON or text; redacts password/token/secret keys; fans out to extra sinks | `*slog.Logger` |
 | [`logger/loki`](logger/loki) | Handler that pushes logs to Grafana Loki (stdlib only) | `slog.Handler` |
@@ -200,6 +202,124 @@ if err := set.Refresh(ctx); err != nil { return err } // optional: fail at start
 c, err := jwt.New(jwt.Config{Algorithm: "RS256", KeySource: set, Issuer: "https://idp.example.com/", Audience: []string{"my-api"}})
 claims, err := c.VerifyContext(ctx, bearerToken)       // the context bounds the key fetch
 ```
+
+### Validator: request binding and validation
+
+`validator.Bind(r, &req)` reads a request into a typed struct from four places at once (JSON body, query string, route path
+values and headers), checks it, and returns the filled struct or **every** problem found. It checks syntax, shape and size;
+whether the caller may do something is the service's job.
+
+```go
+type UpdateOrderRequest struct {
+	OrderID string  `path:"orderId"   validate:"required,uuid"`
+	Status string  `body:"status"  validate:"required,oneof=pending shipped delivered" normalize:"trim,lower"`
+	Note   *string `body:"note"    validate:"max=500"`            // nil when absent
+	Notify bool    `query:"notify"`
+	Page   int     `query:"page"   validate:"min=1,max=100" default:"1"`
+	UserID string  `header:"X-User-ID" validate:"required,identifier"`
+	Key    string  `header:"X-Idempotency-Key" validate:"max=64"`
+}
+
+func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
+	var req UpdateOrderRequest
+	if err := validator.Bind(r, &req); err != nil {
+		var verr *validator.Errors
+		if errors.As(err, &verr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(verr.StatusCode()) // 400, 413 for a too-large body, 415 for a wrong content type
+			w.Write(verr.JSON())             // {"errors":[{"source":"body","field":"status","code":"oneof","message":"..."}]}
+			return
+		}
+		http.Error(w, "internal error", 500) // validator.IsSetupError(err): a mistake in the struct, not the request
+		return
+	}
+	// req is complete and checked; call the service.
+}
+```
+
+Also `validator.Parse[T](r)`, and `validator.New(opts...)` for a reusable instance with options: `MaxBodySize`,
+`MaxValueSize`, `MaxJSONDepth`, `AllowUnknownBodyFields`, `RejectUnknownQuery`, `PathValue` (for routers other than
+net/http's, such as chi), `Pattern(name, regexp)` for `pattern=name`, and `Rule(name, fn)` for your own rules.
+
+| Tag | Meaning |
+| --- | --- |
+| `body:"k"` `query:"k"` `path:"k"` `header:"K"` | where the field comes from (one per field; untagged fields are not bound) |
+| `validate:"..."` | `required` `min=` `max=` `len=` (numbers, durations, characters, items) `oneof=a b c` `uuid` `identifier` `alphanum` `url` `pattern=name` `dive` `allowcontrol`, plus your own rules |
+| `normalize:"trim,lower,upper"` | explicit normalization before validation; nothing is normalized unless you ask |
+| `default:"x"` | value when the request has none (scalar query, header and path fields) |
+| `each:"..."` | rules applied to every element of a slice |
+
+Types: strings, `bool` (`true` or `false` only), integers, floats (plain decimals only), `time.Duration`, `time.Time` (RFC 3339),
+anything with `UnmarshalText`, pointers for optional values, and slices for repeatable query and header values. In a JSON body a
+duration is a string such as `"30s"`, and any JSON-decodable type works. `dive` validates nested structs and slices of structs.
+
+Strict on purpose, because the alternative is quietly choosing a value an attacker controls: a scalar query or header that
+appears twice (or two `Content-Type` headers) is an error; bodies must be one JSON object of valid UTF-8 with **no duplicate keys
+at any depth, counting keys that differ only by letter case (`sku` and `SKU`) as duplicates**, no trailing data, limited nesting and size (1 MiB by default), exact-case keys, and no unknown keys unless you
+allow them; malformed query strings are rejected, not half-read; strings must be free of control characters (tab, newline
+and carriage return are allowed in body text); invalid values are rejected, never silently cleaned; and on any error your struct is
+left unchanged. Errors name the source, field and a stable code, and **never contain the rejected value**.
+
+**Headers prove nothing by themselves.** Binding `X-User-ID` checks only that the value has the right shape. It can be trusted
+only if the ingress in front of your service authenticated the caller and replaced any value the client sent. Business rules
+(stock levels, who may see which records, state transitions) and authorization stay in the owning service.
+
+### Service building blocks: request IDs, middleware, server, HTTP client
+
+None of these is tied to one product or architecture. They are the plumbing every service repeats.
+
+```go
+log, _ := logger.New(logger.Config{ContextAttrs: logger.JoinContextAttrs(telemetry.TraceAttrs, reqctx.Attrs)}) // request_id and trace_id on every line
+
+handler := middleware.Chain(mux,
+	middleware.RequestID(),                       // outermost; reuses a valid incoming X-Request-ID, else generates one (AlwaysGenerate() at the edge)
+	middleware.AccessLog(log),                    // method, path (no query), status, bytes, duration, request ID; never headers or bodies
+	middleware.Recover(log),                      // a panic becomes a fixed 500 JSON body and one log line
+	middleware.CaptureHeaders("X-Tenant-ID"),     // listed headers into the context, format-checked; only behind a layer that authenticated the caller
+	middleware.MaxBody(1<<20),
+)
+srv, _ := server.New(server.Config{Addr: ":8080", Handler: tel.HTTPHandler(handler, "orders"), Logger: log})
+srv.OnShutdown("postgres", func(ctx context.Context) error { pool.Close(); return nil })
+srv.OnShutdown("telemetry", tel.Shutdown)         // closers run in reverse order, after the last request finishes
+return srv.RunUntilSignal()                       // Ctrl-C / SIGTERM: stop accepting, drain up to ShutdownTimeout, close resources
+```
+
+Calling another service (or an API gateway in front of several):
+
+```go
+api, _ := httpclient.New(httpclient.Config{BaseURL: "https://gateway.internal", PathPrefix: "/api", Headers: map[string]string{"X-Caller": "orders"}})
+payments, _ := api.WithPrefix("payments")        // URLs become /api/payments/...
+var receipt Receipt
+err := payments.JSON(ctx, http.MethodPost, httpclient.Path("charges", chargeID, "capture"), nil, &receipt,
+	httpclient.ForwardFromContext("X-Tenant-ID"), // forwarded only because it is named
+	httpclient.IdempotencyKey("order-77-capture")) // retried only because it has a key
+```
+
+| Package | What it gives you |
+| --- | --- |
+| `reqctx` | `NewRequestID`, `ValidID`, the request ID and captured header values in the context (`WithRequestID`, `WithHeaders`, `HeaderValue`), `Attrs` for logging |
+| `middleware` | `Chain` `RequestID` `CaptureHeaders` `StripHeaders` `Recover` `AccessLog` `MaxBody` `Timeout` `SecureHeaders` |
+| `server` | `New` `Run` `RunUntilSignal` `OnShutdown` `Ready` `Addr` `Health`; slow-client timeouts on by default; `TLSConfig` for TLS and mutual TLS |
+| `httpclient` | `New` `WithPrefix` `Do` `JSON` `Path` and the options `Query` `JSONBody` `Body` `Header` `ForwardFromContext` `IdempotencyKey` `Timeout` `NoRetry` |
+
+Things worth knowing:
+
+- **Request IDs** are only for correlation. An incoming ID is reused only if it is a short, safe string that appears once; anything
+  else (spaces, newlines, duplicates) is replaced, so it cannot forge log lines. They never grant access.
+- **Captured headers prove nothing by themselves.** `CaptureHeaders` checks the format and rejects duplicates, but the values are
+  trustworthy only if the layer in front authenticated the caller and replaced what the client sent. Use `StripHeaders` at the edge.
+- **`httpclient`** builds URLs safely: every path segment is escaped with `httpclient.Path`, `..`, control characters and encoded
+  tricks are refused, the prefix segment must be a plain lower-case word (and can be restricted to an allowlist), redirects are never
+  followed (so headers cannot leak to another host), and responses are size-limited. It sends the request ID from the context and
+  forwards other context values **only when you name them**. GET, HEAD and OPTIONS are retried on network errors and 429/502/503/504
+  with jittered exponential backoff and `Retry-After`; **a write is sent once unless you give an `IdempotencyKey`**, which is the
+  receiving service's promise that a repeat has no second effect (the service must keep that receipt). A timeout is reported as a
+  timeout, never as success, and errors never contain the URL, headers or response body. How the other side knows who is calling
+  (mutual TLS, a signed header, a token) is not decided here: give `HTTPClient` a mutual-TLS transport, or `Sign` to add a signature.
+- **`server`** defaults: 5 s to read headers, 30 s to read, 60 s to write, 120 s idle, 1 MiB of headers, 30 s to drain on shutdown.
+  `Health(checks)` answers 200 or 503 with only the names of failing checks, never error text. Streaming endpoints need a longer
+  `WriteTimeout` (or `http.ResponseController`).
+- Combine with `validator` for request binding and `telemetry` for spans; `internal/e2e` shows two services and a gateway working together.
 
 ### Logger: console, Grafana Loki, OpenTelemetry
 
